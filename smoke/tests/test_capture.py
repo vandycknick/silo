@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -14,10 +15,10 @@ import pytest
 from silo_smoke import capture, fork, images, overlay, pause, procs, reclaim, restore, shutdown, stopped
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 from silo_smoke.config import REPO, SmokeConfig
-from silo_smoke.filesystem import reflink_probe
+from silo_smoke.filesystem import disk_clone_probe
 from silo_smoke.registry import LoopbackRegistry
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = [pytest.mark.krun_live, pytest.mark.slow]
 PROBE = "/usr/local/bin/capture-counter"
 
 
@@ -44,10 +45,8 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
     assert admitted == {"status": "supported"}, admitted
     boot_id = silo.exec(name, "cat", "/proc/sys/kernel/random/boot_id").stdout
     generation = pause.generation(silo, name)
-    counter = capture.Counter(silo, name, PROBE)
-    holders, lease = shutdown.holder(silo, name)
-    processes = [shutdown.Process(entry["pid"]) for entry in holders["holders"]]
-    try:
+    with closing(capture.Counter(silo, name, PROBE)) as counter, \
+            shutdown.observe_holders(silo, name) as (_, lease, processes):
         counter.advances()
         borrowed = None
         if policy == "borrow":
@@ -117,10 +116,6 @@ def test_capture_matched_cut_isolation_and_pause_authority(silo: Silo, capture_i
         if policy == "resume":
             retained_capture_survives_source_removal_and_relocation(
                 silo, name, value["snapshot"]["id"], directory, seal)
-    finally:
-        counter.close()
-        for process in processes:
-            process.close()
 
 
 def retained_capture_survives_source_removal_and_relocation(
@@ -202,6 +197,7 @@ def test_capture_rejects_readonly_virtiofs_before_freeze(silo: Silo, capture_ima
         silo.stop(name)
 
 
+@pytest.mark.linux_only(reason="requires Linux x86_64 ptrace at real capture syscalls")
 @pytest.mark.parametrize(("boundary", "victim", "capture_policy"), [
     (boundary, victim, "full")
     for boundary in (
@@ -529,9 +525,9 @@ def test_capture_taken_alias_refuses_before_pause_and_new_name_succeeds(
 def test_capture_deferred_disk_identity_keeps_sessions_and_pause_authority(
     silo: Silo, capture_image: str, policy: str,
 ) -> None:
-    probe = reflink_probe(silo.ws.silo_home)
+    probe = disk_clone_probe(silo.ws.silo_home)
     if not probe["reflink"]:
-        pytest.skip(f"capture clone ordering requires FICLONE: {probe}")
+        pytest.skip(f"capture clone ordering requires {probe['method']}: {probe}")
     source = "identity-source"
     child = "identity-restored"
     silo.create(source, capture_image, "--cpus", "1", "--memory", "512mib",

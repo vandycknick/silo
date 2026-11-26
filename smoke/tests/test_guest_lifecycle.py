@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import shutil
+import sys
 
 import pytest
 
@@ -10,9 +12,10 @@ from silo_smoke.cli import Silo
 from silo_smoke.config import SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 
-pytestmark = pytest.mark.linux_only
+pytestmark = pytest.mark.krun_live
 
 
+@pytest.mark.linux_only(reason="requires a Linux subreaper and pidfd-owned controller descendants")
 def test_freeze_real_kernel_counter_epochs_and_lost_thaw(silo: Silo, basic_image: str) -> None:
     """Actual cgroup events/counter/status, never native pause or restore evidence."""
     guest_lifecycle.run(silo, basic_image)
@@ -22,6 +25,8 @@ def test_freeze_real_kernel_counter_epochs_and_lost_thaw(silo: Silo, basic_image
 @pytest.fixture(scope="session")
 def activation_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Static guest netlink/gateway probe, built by the existing host compiler (set CC if needed)."""
+    if sys.platform == "darwin" and shutil.which("mkfs.ext4") is None:
+        pytest.skip("restored guest data fixture requires e2fsprogs mkfs.ext4")
     return guest_activation_network.compile_probe(tmp_path_factory.mktemp("activation-probe") / "guest-activation-network")
 
 

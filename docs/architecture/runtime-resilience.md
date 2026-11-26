@@ -61,6 +61,9 @@ the separately configured system appliance host capabilities. Each vector has
 `pause`, `capture`, `restore`, `fork`, and `incremental`, with `native` and
 tagged `supported`/`unsupported` availability and a closed reason code.
 The native implementation bit is diagnostic, not product admission.
+On admitted macOS arm64 krun hosts these five entries report `native: true`
+and `supported`; the real machine's attached devices and guest profile
+still determine machine support. `silo start` wakes a hibernated machine.
 
 Host-capability discovery keys its cache by the selected monitor's file
 metadata without hashing the binary. Restore uses the resolved monitor path
@@ -88,9 +91,8 @@ These endpoints refuse unsupported operations with typed capability errors.
 They never stop a machine, capture only its disks, or cold boot as a fallback.
 `snapshot create` on a running VM without `--memory` is refused ("VM is running:
 stop it first, or use --memory to include its memory"), and `--memory` on a
-stopped VM is refused. On krun, a live refusal suggests stopping the machine
-with `silo stop`, then taking a snapshot without memory. On VZ, snapshots,
-forks and live operations need the krun backend.
+stopped VM is refused. On krun with HVF, a live refusal reports its exact
+reason. On VZ, snapshots, forks and live operations need the krun backend.
 
 Snapshot-with-memory and live fork requests default to incremental capture and a 60 percent
 dirty crossover. `--capture-policy full` forces full capture; the existing

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 import pytest
@@ -202,6 +203,26 @@ def settled(silo: Silo, name: str, backing: str = "boot") -> Sample:
             quiet_since = time.monotonic()
         last = current
     return last
+
+
+def settle_before_capture(silo: Silo, name: str) -> None:
+    """Wait for initial reclaim without requiring Linux RSS measurements on HVF."""
+    if sys.platform == "linux":
+        settled(silo, name)
+        return
+    deadline = time.monotonic() + RECLAIM_TIMEOUT
+    quiet_since = time.monotonic()
+    previous: int | None = None
+    while time.monotonic() - quiet_since < SETTLE_QUIET:
+        status = silo.info(name).get("host_memory_reclaim")
+        if status is None or not status["effective"]:
+            return
+        released = status["released_bytes"]
+        if released != previous:
+            previous = released
+            quiet_since = time.monotonic()
+        assert time.monotonic() < deadline, f"{name}: free-page reporting never settled: {status}"
+        time.sleep(POLL_INTERVAL)
 
 
 def mount(silo: Silo, name: str) -> None:

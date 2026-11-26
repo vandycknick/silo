@@ -98,20 +98,13 @@ def test_pause_resume_retains_guest_session_and_user_authority(silo: Silo, basic
         counter.close()
 
 
-@pytest.mark.linux_only(reason="requires procfs start times and pidfds for exact paused-run storage holders")
+@pytest.mark.krun_live
 def test_pause_stop_releases_exact_storage_holders(silo: Silo, vm: Vm) -> None:
     silo.run("pause", vm.name)
     assert silo.info(vm.name)["state"] == "paused"
-    holders, lease = shutdown.holder(silo, vm.name)
-    processes: list[shutdown.Process] = []
-    try:
-        for entry in holders["holders"]:
-            processes.append(shutdown.Process(entry["pid"]))
+    with shutdown.observe_holders(silo, vm.name) as (_, lease, processes):
         silo.stop(vm.name)
         for process in processes:
             process.wait()
         assert not shutdown.lease_busy(lease)
         assert silo.info(vm.name)["state"] == "stopped"
-    finally:
-        for process in processes:
-            process.close()

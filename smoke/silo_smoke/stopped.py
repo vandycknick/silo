@@ -129,9 +129,7 @@ def restore(silo: Silo, reference: str, child: str) -> None:
 
 
 def stop(silo: Silo, name: str, *, require_clean: bool = True) -> None:
-    bound, lease = shutdown.holder(silo, name)
-    processes = [shutdown.Process(entry["pid"]) for entry in bound["holders"]]
-    try:
+    with shutdown.observe_holders(silo, name) as (bound, lease, processes):
         silo.stop(name, timeout="45s")
         terminal = shutdown.exit_record(silo, name, bound["runId"])
         for process in processes:
@@ -142,9 +140,6 @@ def stop(silo: Silo, name: str, *, require_clean: bool = True) -> None:
             shutdown.assert_clean(silo, name, terminal)
         else:
             assert actual in {"forced", "unknown"}, "capture may not invent stronger shutdown evidence"
-    finally:
-        for process in processes:
-            process.close()
 
 
 def mount_evidence(silo: Silo, expected: str | None = None) -> dict:

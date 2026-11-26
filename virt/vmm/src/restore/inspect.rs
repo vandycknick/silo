@@ -306,4 +306,41 @@ mod tests {
         assert_eq!(failure.refusal.pin, "restore-inputs");
         assert!(failure.refusal.actual.contains("fingerprint changed"));
     }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_survives_nested_inspection_error() {
+        use crate::krun::restore::native_inspection_error;
+        use crate::restore::inspect::inspection_failure;
+        use libkrun::live::inspection::{HvfCompatibilityError, InspectionError};
+        use libkrun::live::StateBinding;
+        use vm_spec::restore::RestorePortabilityRefusal;
+
+        let binding = StateBinding {
+            live_state_schema: libkrun::capabilities::LIVE_STATE_SCHEMA.into(),
+            architecture: std::env::consts::ARCH.into(),
+            profile: [1; 32],
+            topology: [2; 32],
+            ram_layout: [3; 32],
+            source_run: [4; 16],
+            pause_generation: 1,
+            capture: [5; 16],
+        };
+        let native = InspectionError::HvfHost(HvfCompatibilityError::CounterFrequency {
+            saved: 24_000_000,
+            destination: 19_200_000,
+        });
+        let error = eyre::Report::new(native_inspection_error(native, &binding))
+            .wrap_err("native worker preflight")
+            .wrap_err("restore inspection");
+        let expected =
+            RestorePortabilityRefusal::new("clock.counter-frequency", "24000000", "19200000");
+        let failure = inspection_failure(&error);
+        failure.validate().unwrap();
+        assert_eq!(failure.refusal, expected);
+        assert_eq!(
+            failure.refusal.to_string(),
+            "restore-preflight: clock.counter-frequency expected 24000000, destination 19200000; no execution child started",
+        );
+    }
 }

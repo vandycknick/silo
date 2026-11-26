@@ -310,6 +310,17 @@ def output_identities(directory: Path) -> dict:
 def assert_writers_closed(pid: int, directory: Path) -> None:
     identities = {(path.stat().st_dev, path.stat().st_ino)
                   for path in directory.iterdir() if path.is_file() and path.name in CAPTURE_OUTPUTS}
+    if sys.platform == "darwin":
+        from silo_smoke import procs
+
+        for _, path, access in procs.file_access_modes(pid):
+            try:
+                info = Path(path).stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            if (info.st_dev, info.st_ino) in identities:
+                require(access == os.O_RDONLY, "native completion retains writable output descriptor")
+        return
     for entry in Path(f"/proc/{pid}/fd").iterdir():
         try:
             info = entry.stat()

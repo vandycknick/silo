@@ -3,14 +3,14 @@
 Uses the session BASIC image, without compiling the slow capture witnesses.
 The multidisk helper installs two small managed ext4 disks under the lifecycle
 lock, so these exercise included writable storage, not external --disk grants.
-Memory capture is Linux only; the never-started case needs no guest execution
-and runs on every krun host.
+The never-started case needs no guest execution and runs on every krun host.
 """
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import pytest
@@ -50,7 +50,7 @@ def verify(silo: Silo, snapshot: str) -> None:
     assert value["streams"] > 0 and value["bytes"] > 0
 
 
-@pytest.mark.linux_only
+@pytest.mark.krun_live
 def test_raw_root_live_snapshot_restore_fork_and_stopped(silo: Silo, basic_image: str) -> None:
     source = "raw-live-source"
     create(silo, basic_image, source, "raw")
@@ -61,7 +61,7 @@ def test_raw_root_live_snapshot_restore_fork_and_stopped(silo: Silo, basic_image
     silo.exec(source, "sh", "-eu", "-c", "printf 'first\\n' >/raw-live-marker; sync", user="root")
     # Boot free-page reporting dirties reclaimed RAM. Settle before establishing
     # the baseline so the second cut actually exercises incremental capture.
-    reclaim.settled(silo, source)
+    reclaim.settle_before_capture(silo, source)
     first, first_seal = live_snapshot(silo, source, "raw-live-first")
     assert first_seal["memory"]["mode"] == "full"
     silo.exec(source, "sh", "-eu", "-c", "printf 'changed\\n' >/raw-live-marker; sync", user="root")
@@ -103,7 +103,7 @@ def test_raw_root_live_snapshot_restore_fork_and_stopped(silo: Silo, basic_image
     assert silo.exec(stopped_child, "cat", "/raw-live-marker").stdout == "changed\n"
 
 
-@pytest.mark.linux_only
+@pytest.mark.krun_live
 def test_layered_root_live_snapshot_restores_managed_raw_data(silo: Silo, basic_image: str) -> None:
     source = "raw-data-source"
     create(silo, basic_image, source, "layered")
@@ -137,7 +137,7 @@ sync
                      "/capture-b/raw-live-marker").stdout == "root-at-cut\ndata-a-at-cut\ndata-b-at-cut\n"
 
 
-@pytest.mark.linux_only
+@pytest.mark.krun_live
 @pytest.mark.parametrize(("member", "unit", "role"), [
     ("memory", stream_map.RAM_CHUNK, "RAM"), ("root", stream_map.DISK_CHUNK, "root disk"),
 ])
@@ -160,8 +160,9 @@ def test_verify_localizes_flipped_payload_despite_warm_receipts(
         restore.restore_child(silo, snapshot, child)
         # This is the actual file mapped into the restored guest, not a second
         # staging copy or a claimed stream ID from a CLI response.
-        mapping = fork.ram_mapping(fork.worker(silo, child), path)
-        assert mapping["inode"] == path.stat().st_ino and mapping["mappedBytes"] > 0
+        if sys.platform == "linux":
+            mapping = fork.ram_mapping(fork.worker(silo, child), path)
+            assert mapping["inode"] == path.stat().st_ino and mapping["mappedBytes"] > 0
         assert stream_map.from_file(path, unit)[0].identity == binding["stream"]
         silo.stop(child)
     silo.stop(source)
@@ -192,7 +193,7 @@ def test_verify_localizes_flipped_payload_despite_warm_receipts(
     verify(silo, snapshot)
 
 
-@pytest.mark.linux_only
+@pytest.mark.krun_live
 @pytest.mark.parametrize("height", range(5))
 def test_verify_refuses_corrupt_map_node_closure(silo: Silo, basic_image: str, height: int) -> None:
     source = "verify-node"
@@ -233,7 +234,7 @@ def memory_column(silo: Silo) -> dict[str, str]:
     return {row.split()[0]: row.split()[2] for row in lines[1:]}
 
 
-@pytest.mark.linux_only
+@pytest.mark.krun_live
 def test_snapshot_memory_is_explicit_and_without_memory_restores_disks_only(silo: Silo, basic_image: str) -> None:
     source = "memory-choice-source"
     create(silo, basic_image, source, "layered")

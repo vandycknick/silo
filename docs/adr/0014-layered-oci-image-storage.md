@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Updated: 2026-11-24
+Updated: 2026-11-26
 
 ## Status
 
@@ -68,6 +68,10 @@ The 2026-11-24 revision specifies that overlay boot does not qualify the
 monitor. Linux and macOS launch it by its resolved path, exactly as for raw
 roots. [ADR 0018](0018-silo-vmm-contract.md) defines the common launch rule
 for boot and restore.
+
+The 2026-11-26 revision admits snapshots with memory, execution restore and
+live fork for krun on macOS arm64 under [ADR 0021](0021-live-snapshots-and-forks.md).
+The disk and snapshot formats and the VZ exclusions are unchanged.
 
 ## Implementation status (2026-11-09)
 
@@ -2160,6 +2164,10 @@ Application consistency is no stronger than the recorded stop outcome and any
 explicit application quiescence the user performed.
 
 ### Live capture boundary
+
+These rules apply to admitted krun profiles on both Linux and macOS arm64.
+On macOS the native RAM path copies baseline data when needed and does not
+clone RAM or punch holes. The writable disk clone and copy rules still apply.
 
 A snapshot with memory of a running machine follows [ADR 0021](0021-live-snapshots-and-forks.md) instead of the
 stopped procedure above. For storage, that means: the monitor proves every

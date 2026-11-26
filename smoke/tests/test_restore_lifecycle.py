@@ -13,11 +13,13 @@ from __future__ import annotations
 from contextlib import ExitStack, closing
 import ipaddress
 import json
+import os
 import signal
 import socket
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 from pathlib import Path
 from uuid import UUID
@@ -32,7 +34,6 @@ from silo_smoke.restore_lifecycle import restore_network_image  # noqa: F401  se
 # VM cases use the staged runtime selected by SILO_SMOKE_BIN_DIR and
 # SILO_SMOKE_RUNTIME_DIR. They are slow; the host-only oracle tests below
 # use real bytes, sockets and files, no VM.
-pytestmark = [pytest.mark.linux_only]
 SOURCE = "restore-net-source"
 UNIX_FORWARD = f"host:unix:svc.sock=guest:tcp:127.0.0.1:{lifecycle.LISTEN_PORT}"
 UNIX_LISTENER = "host:unix:svc.sock"
@@ -209,14 +210,44 @@ def test_follower_keeps_new_files_after_unlink_and_ignores_existing(tmp_path: Pa
     assert (tmp_path / "copies/child__vm.trace.log").read_bytes() == b"first\nsecond\n"
 
 
+@pytest.mark.macos_only
+def test_darwin_observes_one_process_generation_until_exit() -> None:
+    with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                          stdin=subprocess.PIPE) as child:
+        assert child.stdin is not None
+        birth = procs.darwin_birth(child.pid)
+        assert birth is not None and 0 <= birth[1] < 1_000_000
+        with pytest.raises(AssertionError):
+            shutdown.observe_exit(child.pid, birth[0] - 1)
+        with closing(shutdown.observe_exit(child.pid, birth[0])) as observer:
+            assert not observer.terminal()
+            child.stdin.close()
+            observer.wait(timeout=5)
+            assert observer.terminal()
+        assert child.wait(timeout=5) == 0
+        assert procs.darwin_birth(child.pid) is None
+
+
+@pytest.mark.macos_only
+def test_darwin_listener_owner_observes_live_socket() -> None:
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        port = listener.getsockname()[1]
+        assert listening_owner(port) == (listener.fileno(), os.getpid())
+
+
+@pytest.mark.krun_live
 @pytest.mark.slow
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("construction", ["restore", "fork"])
-@pytest.mark.parametrize("termination", ["stop", "worker-crash"])
+@pytest.mark.parametrize("termination", [
+    "stop",
+    pytest.param("worker-crash", marks=pytest.mark.linux_only(reason="requires pidfd signaling")),
+])
 def test_restored_child_cold_start_keeps_its_own_disk_writes(
-    silo: Silo, restore_image: str, profile: RootProfile, construction: str, termination: str,
+    silo: Silo, request: pytest.FixtureRequest, profile: RootProfile, construction: str, termination: str,
 ) -> None:
     source, child = "cold-start-source", "cold-start-child"
+    restore_image = request.getfixturevalue("basic_image" if sys.platform == "darwin" else "restore_image")
     restore.create_source(silo, restore_image, profile=profile, name=source, network="private")
     silo.exec(source, "sh", "-eu", "-c",
               "printf source-cut >/var/lib/cold-start-marker; sync", user="root")
@@ -269,6 +300,7 @@ def test_restored_child_cold_start_keeps_its_own_disk_writes(
     assert silo.exec(child, "cat", "/var/lib/cold-start-marker").stdout == "child-only"
 
 
+@pytest.mark.krun_live
 @pytest.mark.slow
 def test_restore_exposes_only_the_fresh_destination_after_final_release(
     silo: Silo, restore_network_image: str,  # noqa: F811
@@ -405,6 +437,7 @@ def test_restore_exposes_only_the_fresh_destination_after_final_release(
                 children.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 @pytest.mark.parametrize("ack", ["late", "missing"])
 def test_restore_generation_acknowledgement_missing_or_late_fails_closed(
@@ -453,6 +486,7 @@ def test_restore_generation_acknowledgement_missing_or_late_fails_closed(
             evidence.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 def test_restore_undelivered_activate_fails_closed(
     silo: Silo, restore_network_image: str,  # noqa: F811
@@ -488,6 +522,7 @@ def test_restore_undelivered_activate_fails_closed(
             evidence.close()
 
 
+@pytest.mark.krun_live
 @pytest.mark.slow
 @pytest.mark.serial
 def test_restore_listener_conflict_fails_closed_without_taking_the_source_listener(
@@ -531,7 +566,18 @@ def test_restore_listener_conflict_fails_closed_without_taking_the_source_listen
 
 
 def listening_owner(port: int) -> tuple[int, int] | None:
-    """(socket inode, owning pid) of the host's listening 127.0.0.1:port."""
+    """(socket inode or Darwin descriptor, owning pid) of the listener."""
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", "-a", f"-iTCP@127.0.0.1:{port}", "-sTCP:LISTEN", "-Fpf"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 1 and not result.stdout and not result.stderr:
+            return None
+        result.check_returncode()
+        fields = result.stdout.splitlines()
+        assert len(fields) == 2 and fields[0].startswith("p") and fields[1].startswith("f"), fields
+        return int(fields[1][1:]), int(fields[0][1:])
     inode = None
     for line in Path("/proc/net/tcp").read_text().splitlines()[1:]:
         fields = line.split()
@@ -551,6 +597,7 @@ def listening_owner(port: int) -> tuple[int, int] | None:
     return inode, -1
 
 
+@pytest.mark.krun_live
 @pytest.mark.slow
 @pytest.mark.parametrize("hook", ["exit", "timeout"])
 def test_restore_failed_activation_hook_fails_closed(
@@ -578,6 +625,7 @@ def test_restore_failed_activation_hook_fails_closed(
             evidence.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 @pytest.mark.parametrize("recovery", ["refrozen", "reaped"])
 def test_restore_lost_thaw_acknowledgement_refreezes_or_reaps(
@@ -623,6 +671,7 @@ def test_restore_lost_thaw_acknowledgement_refreezes_or_reaps(
             evidence.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 def test_restore_refrozen_activation_failed_is_stop_only_with_manager_suspended(
     silo: Silo, restore_network_image: str,  # noqa: F811
@@ -758,6 +807,7 @@ def test_restore_refrozen_activation_failed_is_stop_only_with_manager_suspended(
                 children.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 def test_restore_manager_death_during_unacknowledged_thaw_reaps_child(
     silo: Silo, restore_network_image: str,  # noqa: F811
@@ -811,6 +861,7 @@ def test_restore_manager_death_during_unacknowledged_thaw_reaps_child(
                 children.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.slow
 @pytest.mark.parametrize("victim", ["manager", "monitor", "krun-worker"])
 def test_restore_crash_while_activating(

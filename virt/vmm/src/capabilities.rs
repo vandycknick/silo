@@ -829,9 +829,11 @@ mod tests {
             for operation in LiveOperation::ALL {
                 assert_eq!(
                     native_primitive(operation, &operations),
-                    lane == native::NativeLane::KvmX86_64
-                        || (operation == LiveOperation::Pause
-                            && lane != native::NativeLane::Unsupported)
+                    matches!(
+                        lane,
+                        native::NativeLane::KvmX86_64 | native::NativeLane::HvfArm64GicV3
+                    ) || (operation == LiveOperation::Pause
+                        && lane != native::NativeLane::Unsupported)
                 );
             }
         }
@@ -1094,39 +1096,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn capabilities_hvf_pause_follows_the_floor_and_withheld_operations_stay_build_excluded() {
+    fn capabilities_hvf_vector_reports_support_and_keeps_the_os_floor() {
+        let operations = native::NativeLiveOperations::for_lane(native::NativeLane::HvfArm64GicV3);
         let facts = |version: &str, operation| EvaluationFacts {
             backend_allowed: true,
-            // libkrun's HVF lane admits pause and withholds the rest.
-            native: operation == LiveOperation::Pause,
+            native: native_primitive(operation, &operations),
             delivered: true,
             host: HostAdmission {
                 os_floor: macos_floor(version),
                 ..admitted()
             },
         };
-        let unsupported = |code| LiveAvailability::Unsupported {
-            reason: LiveUnsupportedReason::new(code),
-        };
         let current = evaluate_vector(|operation| facts("26.0", operation)).expect("evaluated");
-        assert_eq!(current.pause.availability, LiveAvailability::Supported);
         let older = evaluate_vector(|operation| facts("25.4", operation)).expect("evaluated");
-        assert_eq!(
-            older.pause.availability,
-            unsupported(LiveReasonCode::HostOsBelowFloor)
-        );
-        for vector in [current, older] {
-            for capability in [
-                vector.capture,
-                vector.restore,
-                vector.fork,
-                vector.incremental,
-            ] {
-                assert_eq!(
-                    capability.availability,
-                    unsupported(LiveReasonCode::BuildExcluded)
-                );
-            }
+        for operation in LiveOperation::ALL {
+            assert!(current.get(operation).native);
+            assert_eq!(
+                current.get(operation).availability,
+                LiveAvailability::Supported
+            );
+            assert!(older.get(operation).native);
+            assert_eq!(
+                older.get(operation).availability,
+                LiveAvailability::Unsupported {
+                    reason: LiveUnsupportedReason::new(LiveReasonCode::HostOsBelowFloor),
+                }
+            );
         }
     }
 
@@ -1238,8 +1233,7 @@ mod tests {
         }
     }
 
-    /// The regression behind every failed krun start on macOS: the real host
-    /// report must evaluate, with pause native and the rest withheld.
+    /// The real machine-less host query reports every HVF primitive.
     #[cfg(target_os = "macos")]
     #[test]
     fn capabilities_real_hvf_host_report_evaluates() {
@@ -1248,19 +1242,18 @@ mod tests {
             .host_report()
             .unwrap();
         assert_eq!(report.lane, LiveLane::HvfArm64);
-        assert!(report.live.pause.native);
-        for capability in [
-            &report.live.capture,
-            &report.live.restore,
-            &report.live.fork,
-            &report.live.incremental,
-        ] {
-            assert_eq!(
-                capability.availability,
-                LiveAvailability::Unsupported {
-                    reason: LiveUnsupportedReason::new(LiveReasonCode::BuildExcluded)
-                }
-            );
+        for operation in LiveOperation::ALL {
+            let capability = report.live.get(operation);
+            assert!(capability.native, "{operation}");
+            if let LiveAvailability::Unsupported { reason } = &capability.availability {
+                assert!(
+                    matches!(
+                        reason.code,
+                        LiveReasonCode::HostOsBelowFloor | LiveReasonCode::HypervisorUnavailable
+                    ),
+                    "{operation}: {reason:?}"
+                );
+            }
         }
     }
 }

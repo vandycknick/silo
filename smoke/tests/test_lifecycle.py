@@ -100,7 +100,7 @@ def test_boot_failure_leaves_machine_stopped(
     assert silo.run("rm", name, "--force").returncode == 0
 
 
-@pytest.mark.linux_only
+@pytest.mark.krun_live
 @pytest.mark.slow
 def test_restart_after_live_lineage_snapshot_removal_and_prune(
     silo: Silo, basic_image: str,

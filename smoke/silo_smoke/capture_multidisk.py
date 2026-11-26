@@ -12,11 +12,14 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import struct
 import sqlite3
 import subprocess
 import sys
 from uuid import UUID, uuid4
+
+import pytest
 
 from . import capture, overlay, procs, shutdown, stopped, toolchain
 from .cli import Silo
@@ -36,6 +39,8 @@ def compile_probe(output: Path) -> Path:
 
 def install_disks(silo: Silo, name: str, *, external: bool = False) -> list[str]:
     """Install managed disks, or one managed and one external writable disk, under the real lock."""
+    if sys.platform == "darwin" and shutil.which("mkfs.ext4") is None:
+        pytest.skip("managed ext4 disk fixtures require e2fsprogs mkfs.ext4")
     config = stopped.configuration(silo, name)
     lock = silo.ws.run_root / "locks" / str(config["lockId"])
     fd = os.open(lock, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)

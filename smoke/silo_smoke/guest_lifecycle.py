@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from . import overlay, prereqs, shutdown, stopped
 from .cli import Silo
+from .filesystem import copy_sparse
 from .overlay_candidate import cpio
 
 
@@ -85,7 +86,7 @@ def private_root(silo: Silo, image: str, prefix: str) -> tuple[dict, Path]:
     directory = silo.ws.root / (prefix + uuid4().hex[:8])
     directory.mkdir(mode=0o700)
     root = directory / "root.raw"
-    subprocess.run(["cp", "--reflink=auto", "--sparse=always", str(source), str(root)], check=True, capture_output=True, timeout=120)
+    copy_sparse(source, root, timeout=120)
     root.chmod(0o600)
     disk["path"] = str(root)
     return disk, directory

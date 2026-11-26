@@ -128,8 +128,12 @@ roots are rejected. No EFI layout or provider bootloader is synthesized.
 
 ## Live operations with stock images
 
-On supported libkrun hosts, stock systemd, busybox and OpenRC images support
-pause/resume, hibernate/wake, snapshots with memory, restore and live fork without an `init=` override.
+On admitted libkrun hosts, including macOS 26 on Apple silicon (HVF), stock
+systemd, busybox and OpenRC images support pause/resume, hibernate/wake,
+snapshots with memory, restore and live fork without an `init=` override.
+Use `silo system info` to see host capabilities; `silo info` shows the
+running machine's capabilities. macOS 27 is unqualified.
+
 The image init remains PID 1 inside a contained cgroup namespace; Silo sessions
 use a separate workload cgroup. `silo info` reports boot mode `contained-init`.
 
@@ -243,6 +247,10 @@ First owned reflink RAM publication trusts producer identities without readback.
 Cold durable restore and export authenticate RAM; warm restore can reuse an
 unchanged-inode verification receipt, and local forks trust owned producer RAM.
 See ADR 0021 for these distinct corruption-detection boundaries.
+
+On macOS the native RAM path does not clone RAM or punch holes. Incremental
+capture still reduces live guest reads, but memory files can be larger and
+capture slower than on optimized Linux hosts.
 
 ## Stopped handoff
 
@@ -473,6 +481,10 @@ VM; it resolves like `create`, with the snapshot kind expected. A snapshot
 preserves its complete captured configuration; only `--name` applies. A
 snapshot without memory restores stopped; a snapshot with memory requires
 compatible live-restore admission rather than falling back to a cold boot.
+Do not assume memory snapshots are portable across hosts. On HVF, preflight
+checks destination compatibility, but only a real restore can accept or
+reject opaque interrupt-controller state.
+
 For explicit storage-only recovery, use
 `silo restore <SNAPSHOT> --without-memory --name <CHILD>`. This creates a stopped
 machine with private disks and the captured boot assets; RAM is discarded and

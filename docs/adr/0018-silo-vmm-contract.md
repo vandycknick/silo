@@ -8,11 +8,10 @@ Updated: 2026-11-26
 
 Accepted
 
-The storage lease and shutdown-evidence additions below are planned contract
-extensions admitted with [ADR 0014](0014-layered-oci-image-storage.md), and
-the live-command and restore additions are planned extensions admitted with
-[ADR 0021](0021-live-snapshots-and-forks.md). Neither is a claim about the
-currently delivered monitor or backends.
+The storage lease and shutdown-evidence extensions follow
+[ADR 0014](0014-layered-oci-image-storage.md). The live-command and restore
+extensions follow [ADR 0021](0021-live-snapshots-and-forks.md); capability
+reports determine which operations a backend and host can deliver.
 
 The 2026-11-01 owner decision makes the combined ADR 0014/0021 implementation
 a **hard breaking release** requiring reinstall and a full state wipe.
@@ -26,7 +25,8 @@ resolved path on Linux and Darwin.
 The 2026-11-26 revision applies the same rule to every launch, including
 restore, on all hosts. The manager does not retain or compare the executable's
 identity between inspection and launch. Native inspection of the saved state
-determines restore compatibility. Darwin still does not admit restore.
+determines restore compatibility, subject to construction-time checks. This
+revision also admits restore on krun with HVF on macOS arm64.
 
 Supersedes the "`vmm` Process Model" and "Startup and Shutdown Semantics"
 sections of [ADR 0004](0004-daemonless-architecture.md). The daemonless
@@ -170,8 +170,8 @@ restores CLOEXEC before starting threads or unrelated children. Every launch,
 including restore, starts the monitor by its resolved path on all hosts.
 The manager does not retain or compare the executable's identity between
 inspection and launch. The monitor's native inspection of the saved state
-admits or refuses restore on supported hosts. Darwin still does not admit
-restore. The Linux worker re-execs `/proc/self/exe`.
+admits or refuses restore on supported hosts, including krun with HVF on
+macOS arm64. The Linux worker re-execs `/proc/self/exe`.
 Manager lease ownership includes complete startup or actual failure cleanup.
 Monitor/worker lease ownership includes attachment terminality; the monitor
 also retains its lease through checked finalization and durable exit publication.
@@ -319,7 +319,7 @@ observe healthy completion, forced/crash refusal, retained-inode sync failure
 and a stopped worker surviving monitor death. Injected syscall EIO is labelled
 as such, never as physical-media failure.
 
-### Live commands, restore inputs and capture evidence (planned, ADR 0021)
+### Live commands, restore inputs and capture evidence (ADR 0021)
 
 [ADR 0021](0021-live-snapshots-and-forks.md) adds a nonterminal lifecycle to the monitor. Its additions keep every
 promise above: the monitor still never opens the database, still writes only
@@ -366,6 +366,12 @@ when the backend supplies the native primitive and host and machine checks pass.
 Snapshots record `liveStateSchema` and guest `architecture`; restore refuses
 those format/architecture mismatches, not different native or monitor builds.
 Each component checks its own state magic and schema when decoding.
+
+On macOS arm64, krun reports native pause, capture, restore, fork and
+incremental support. The existing macOS 26 floor and host and machine
+admission checks still apply. HVF inspection can refuse a mismatch without
+creating a VM; the real restore must still install the opaque GIC state.
+macOS 27 is unqualified. VZ remains excluded.
 
 Machine admission accepts observed `AgentPid1` with `agent_is_pid1=true` or
 `ContainedInit` with `agent_is_pid1=false`, subject to the remaining lifecycle

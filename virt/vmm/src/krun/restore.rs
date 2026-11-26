@@ -7,18 +7,21 @@ use std::fs::File;
 use std::io;
 use std::time::Instant;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use libkrun::live::inspection::HvfCompatibilityError;
 use libkrun::live::inspection::{
-    AdmittedDeviceKind, AdmittedShape, ExpectedDevice, ExpectedDeviceKind, InspectionInputs,
+    AdmittedDeviceKind, AdmittedShape, ExpectedDevice, ExpectedDeviceKind, InspectionError,
+    InspectionInputs,
 };
 use libkrun::live::restore::{
     NativeFileFingerprint, RestoreIdentity, StateObjectAuthority, StateObjectIdentity,
 };
 use libkrun::live::{RamImageAuthentication, RamInputAuthority, StateBinding};
-use vm_spec::capture::CaptureConfiguration;
+use vm_spec::capture::{CaptureConfiguration, Sha256Digest};
 use vm_spec::lifecycle::LiveId;
 use vm_spec::restore::{
-    RestoreAdmittedDevice, RestoreDeviceKind, RestoreObjectRole, RestoreRequest,
-    RESTORE_BALLOON_ID as BALLOON_ID, RESTORE_CONSOLE_ID as CONSOLE_ID,
+    RestoreAdmittedDevice, RestoreDeviceKind, RestoreObjectRole, RestorePortabilityRefusal,
+    RestoreRequest, RESTORE_BALLOON_ID as BALLOON_ID, RESTORE_CONSOLE_ID as CONSOLE_ID,
     RESTORE_GENERATION_ID as GENERATION_ID, RESTORE_NETWORK_ID as NETWORK_ID,
     RESTORE_RNG_ID as RNG_ID, RESTORE_VSOCK_ID as VSOCK_ID,
 };
@@ -233,96 +236,164 @@ pub(crate) fn inspect(
         &devices,
         deadline,
     )
-    .map_err(|error| {
-        use libkrun::live::inspection::InspectionError;
-        let format_refusal = match &error {
-            InspectionError::Schema { expected, found } => {
-                Some(vm_spec::restore::RestorePortabilityRefusal::new(
-                    "live-state-schema",
-                    *expected,
-                    found.clone(),
-                ))
-            }
-            InspectionError::Architecture { expected, found } => {
-                Some(vm_spec::restore::RestorePortabilityRefusal::new(
-                    "architecture",
-                    *expected,
-                    found.clone(),
-                ))
-            }
-            _ => None,
-        };
-        if let Some(refusal) = format_refusal {
-            return io::Error::new(io::ErrorKind::InvalidData, refusal);
-        }
-        let pin = match &error {
-            InspectionError::Schema { .. } => "live-state-schema",
-            InspectionError::Architecture { .. } => "architecture",
-            InspectionError::Lane => "guest-isa/hypervisor",
-            InspectionError::Codec { .. } => "capture-abi/device-codec",
-            InspectionError::Binding => "execution-binding",
-            InspectionError::Profile(cause)
-                if cause.contains("cpuid") || cause.contains("CPUID") =>
-            {
-                "cpu.cpuid"
-            }
-            InspectionError::Profile(cause)
-                if cause.contains("xsave") || cause.contains("XSAVE") =>
-            {
-                "cpu.xsave"
-            }
-            InspectionError::Profile(cause) if cause.contains("msr") || cause.contains("MSR") => {
-                "cpu.msr-inventory"
-            }
-            InspectionError::Profile(cause) if cause.contains("rate-disagreement") => {
-                "clock.tsc-rate"
-            }
-            InspectionError::Profile(_) => "cpu.profile",
-            InspectionError::Device { .. } | InspectionError::Expectations => "topology.devices",
-            InspectionError::Layout(_) => "ram-layout",
-            InspectionError::Host { cause }
-                if cause.contains("cpuid") || cause.contains("CPUID") =>
-            {
-                "cpu.cpuid"
-            }
-            InspectionError::Host { cause }
-                if cause.contains("xsave") || cause.contains("XSAVE") =>
-            {
-                "cpu.xsave"
-            }
-            InspectionError::Host { cause } if cause.contains("msr") || cause.contains("MSR") => {
-                "cpu.msr-inventory"
-            }
-            InspectionError::Host { cause }
-                if cause.contains("tsc")
-                    || cause.contains("TSC")
-                    || cause.contains("unscaled-rate-mismatch") =>
-            {
-                "clock.tsc-rate"
-            }
-            InspectionError::Host { .. } => "host-build",
-            InspectionError::Descriptor(_) => "storage",
-            InspectionError::Deadline => "host-build",
-        };
-        let expected = binding(request)
-            .map(|binding| match pin {
-                "live-state-schema" => binding.live_state_schema.clone(),
-                "architecture" => binding.architecture.clone(),
-                "ram-layout" => binding.ram_layout.to_string(),
-                _ => binding.profile.to_string(),
-            })
-            .unwrap_or_else(|_| "captured execution contract".into());
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            vm_spec::restore::RestorePortabilityRefusal::new(pin, expected, error.to_string()),
-        )
-    })?;
+    .map_err(|error| native_inspection_error(error, &expected.binding))?;
     if shape.cpu_count() != usize::from(request.configuration.cpus) {
         return Err(invalid(
             "restored vCPU count differs from the captured configuration",
         ));
     }
     Ok(shape)
+}
+
+pub(crate) fn native_inspection_error(error: InspectionError, binding: &StateBinding) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        inspection_refusal(error, binding),
+    )
+}
+
+pub(crate) fn inspection_refusal(
+    error: InspectionError,
+    binding: &StateBinding,
+) -> RestorePortabilityRefusal {
+    let pin = match error {
+        InspectionError::Schema { expected, found } => {
+            return RestorePortabilityRefusal::new("live-state-schema", expected, found);
+        }
+        InspectionError::Architecture { expected, found } => {
+            return RestorePortabilityRefusal::new("architecture", expected, found);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        InspectionError::HvfHost(error) => return hvf_refusal(error),
+        InspectionError::Lane => "guest-isa/hypervisor",
+        InspectionError::Codec { .. } => "capture-abi/device-codec",
+        InspectionError::Binding => "execution-binding",
+        InspectionError::Profile(ref cause)
+            if cause.contains("cpuid") || cause.contains("CPUID") =>
+        {
+            "cpu.cpuid"
+        }
+        InspectionError::Profile(ref cause)
+            if cause.contains("xsave") || cause.contains("XSAVE") =>
+        {
+            "cpu.xsave"
+        }
+        InspectionError::Profile(ref cause) if cause.contains("msr") || cause.contains("MSR") => {
+            "cpu.msr-inventory"
+        }
+        InspectionError::Profile(ref cause) if cause.contains("rate-disagreement") => {
+            "clock.tsc-rate"
+        }
+        InspectionError::Profile(_) => "cpu.profile",
+        InspectionError::Device { .. } | InspectionError::Expectations => "topology.devices",
+        InspectionError::Layout(_) => "ram-layout",
+        InspectionError::Host { ref cause }
+            if cause.contains("cpuid") || cause.contains("CPUID") =>
+        {
+            "cpu.cpuid"
+        }
+        InspectionError::Host { ref cause }
+            if cause.contains("xsave") || cause.contains("XSAVE") =>
+        {
+            "cpu.xsave"
+        }
+        InspectionError::Host { ref cause } if cause.contains("msr") || cause.contains("MSR") => {
+            "cpu.msr-inventory"
+        }
+        InspectionError::Host { ref cause }
+            if cause.contains("tsc")
+                || cause.contains("TSC")
+                || cause.contains("unscaled-rate-mismatch") =>
+        {
+            "clock.tsc-rate"
+        }
+        InspectionError::Host { .. } | InspectionError::Deadline => "host-build",
+        InspectionError::Descriptor(_) => "storage",
+    };
+    let expected = if pin == "ram-layout" {
+        binding.ram_layout
+    } else {
+        binding.profile
+    };
+    RestorePortabilityRefusal::new(
+        pin,
+        Sha256Digest::from_bytes(expected).to_string(),
+        error.to_string(),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hvf_refusal(error: HvfCompatibilityError) -> RestorePortabilityRefusal {
+    use HvfCompatibilityError::*;
+
+    let (pin, expected, actual) = match error {
+        HostQuery(error) => (
+            "host.hvf-query",
+            "destination HVF compatibility facts".into(),
+            error.to_string(),
+        ),
+        CpuCapacity { saved, maximum } => (
+            "cpu.capacity",
+            format!("{saved} vCPUs"),
+            format!("maximum {maximum} vCPUs"),
+        ),
+        IpaRange {
+            region,
+            start,
+            length,
+            destination_bits,
+        } => (
+            "memory.ipa-range",
+            format!("{region:?} at {start:#x} (length {length:#x})"),
+            format!("{destination_bits}-bit IPA space"),
+        ),
+        PageGranule { saved, destination } => (
+            "memory.page-granule",
+            saved.to_string(),
+            destination.to_string(),
+        ),
+        CpuModelRegister { cpu, register, saved, destination } => (
+            "cpu.arm64-model",
+            format!("CPU {cpu} register {register:#06x} = {saved:#018x}"),
+            format!("{destination:#018x}"),
+        ),
+        CounterFrequency { saved, destination } => (
+            "clock.counter-frequency",
+            saved.to_string(),
+            destination.to_string(),
+        ),
+        MachTimebase { saved, destination } => (
+            "clock.mach-timebase",
+            format!("{}/{}", saved.0, saved.1),
+            format!("{}/{}", destination.0, destination.1),
+        ),
+        GicGeometry { saved, destination } => {
+            let geometry = |[dist, dist_len, redist, redist_len]: [u64; 4]| {
+                format!("distributor {dist:#x}/{dist_len:#x}, redistributors {redist:#x}/{redist_len:#x}")
+            };
+            (
+                "interrupt-controller.gic-geometry",
+                geometry(saved),
+                geometry(destination),
+            )
+        }
+        GicBaseAlignment { region, address, alignment } => (
+            "interrupt-controller.gic-base-alignment",
+            format!("{region:?} base {address:#x}"),
+            format!("alignment {alignment:#x}"),
+        ),
+        GicTopology { saved, destination } => (
+            "interrupt-controller.gic-topology",
+            format!("SPI {saved}"),
+            format!("SPI range [{}, {})", destination.start, destination.end),
+        ),
+        MmioPlacement { address, irq, minimum_address, alignment, minimum_irq, maximum_irq } => (
+            "topology.mmio-placement",
+            format!("address {address:#x}, IRQ {irq}"),
+            format!("base >= {minimum_address:#x}, alignment {alignment:#x}, IRQs {minimum_irq}..={maximum_irq}"),
+        ),
+    };
+    RestorePortabilityRefusal::new(pin, expected, actual)
 }
 
 /// The admitted saved device routing, in saved order.
@@ -349,9 +420,13 @@ pub(crate) fn admitted_devices(shape: &AdmittedShape) -> Vec<RestoreAdmittedDevi
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use libkrun::live::inspection::{HvfCompatibilityError, HvfIpaRegion};
     use vm_spec::capture::{CaptureAttachment, CaptureConfiguration, CaptureShare};
 
     use crate::krun::restore::expected_devices;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::krun::restore::hvf_refusal;
 
     fn configuration() -> CaptureConfiguration {
         CaptureConfiguration {
@@ -387,5 +462,163 @@ mod tests {
         let mut rosetta = configuration();
         rosetta.rosetta = true;
         assert!(expected_devices(&rosetta, false).is_err());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_hvf_refusal(error: HvfCompatibilityError, pin: &str, expected: &str, actual: &str) {
+        let refusal = hvf_refusal(error);
+        refusal.validate().unwrap();
+        assert_eq!(refusal.pin, pin);
+        assert_eq!(refusal.expected, expected);
+        assert_eq!(refusal.actual, actual);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_cpu_capacity() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::CpuCapacity {
+                saved: 65,
+                maximum: 64,
+            },
+            "cpu.capacity",
+            "65 vCPUs",
+            "maximum 64 vCPUs",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_ipa_range() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::IpaRange {
+                region: HvfIpaRegion::Ram,
+                start: 0x10_0000_0000,
+                length: 0x4000,
+                destination_bits: 36,
+            },
+            "memory.ipa-range",
+            "Ram at 0x1000000000 (length 0x4000)",
+            "36-bit IPA space",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_page_granule() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::PageGranule {
+                saved: 16384,
+                destination: 4096,
+            },
+            "memory.page-granule",
+            "16384",
+            "4096",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_cpu_model_register() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::CpuModelRegister {
+                cpu: 1,
+                register: 0xc020,
+                saved: 0x1101000011110011,
+                destination: 0x1101000011110010,
+            },
+            "cpu.arm64-model",
+            "CPU 1 register 0xc020 = 0x1101000011110011",
+            "0x1101000011110010",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_counter_frequency() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::CounterFrequency {
+                saved: 24_000_000,
+                destination: 19_200_000,
+            },
+            "clock.counter-frequency",
+            "24000000",
+            "19200000",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_mach_timebase() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::MachTimebase {
+                saved: (125, 3),
+                destination: (1, 1),
+            },
+            "clock.mach-timebase",
+            "125/3",
+            "1/1",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_gic_geometry() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::GicGeometry {
+                saved: [0x9fb0000, 0x10000, 0x9fc0000, 0x40000],
+                destination: [0x9fc0000, 0x20000, 0x9fe0000, 0x20000],
+            },
+            "interrupt-controller.gic-geometry",
+            "distributor 0x9fb0000/0x10000, redistributors 0x9fc0000/0x40000",
+            "distributor 0x9fc0000/0x20000, redistributors 0x9fe0000/0x20000",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_gic_base_alignment() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::GicBaseAlignment {
+                region: HvfIpaRegion::GicDistributor,
+                address: 0x9fb0000,
+                alignment: 0x20000,
+            },
+            "interrupt-controller.gic-base-alignment",
+            "GicDistributor base 0x9fb0000",
+            "alignment 0x20000",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_gic_topology() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::GicTopology {
+                saved: 1020,
+                destination: 32..1020,
+            },
+            "interrupt-controller.gic-topology",
+            "SPI 1020",
+            "SPI range [32, 1020)",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hvf_refusal_mmio_placement() {
+        assert_hvf_refusal(
+            HvfCompatibilityError::MmioPlacement {
+                address: 0x09f0_1000,
+                irq: 128,
+                minimum_address: 0x0a00_0000,
+                alignment: 0x1000,
+                minimum_irq: 32,
+                maximum_irq: 127,
+            },
+            "topology.mmio-placement",
+            "address 0x9f01000, IRQ 128",
+            "base >= 0xa000000, alignment 0x1000, IRQs 32..=127",
+        );
     }
 }

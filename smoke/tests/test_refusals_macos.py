@@ -1,19 +1,15 @@
-"""What a macOS host cannot do yet is refused early, typed, and without side effects.
-
-krun on macOS runs pause and resume only; VZ runs neither. Every other live or
-stopped-storage operation a backend lacks must fail before it changes the
-catalog, a machine directory or the machine's state.
-"""
+"""macOS krun live acceptance and early, typed VZ refusals."""
 from __future__ import annotations
+
+import time
 
 import pytest
 
-from silo_smoke import cloud_disk, stopped
+from silo_smoke import cloud_disk, hibernate, restore, stopped
 from silo_smoke.cli import Result, Silo
 
 pytestmark = pytest.mark.macos_only
 
-KRUN_HINT = "use silo stop, then a snapshot without memory"
 VZ_HINT = "snapshots, forks and live operations need the krun backend"
 
 
@@ -50,24 +46,48 @@ def _refused(silo: Silo, name: str, expected: str, hint: str, *args: str) -> Non
     assert silo.info(name)["state"] == before, args
 
 
-def test_krun_refuses_memory_operations_and_keeps_the_machine_running(silo: Silo, basic_image: str) -> None:
-    if silo.ws.config.backend != "krun":
-        pytest.skip("requires --backend krun")
-    name = "refusal-krun"
-    _running(silo, name, basic_image)
-    try:
-        reason = "build-excluded (backend=krun, lane=hvf-arm64)"
-        _refused(silo, name, f"capture unsupported: {reason}", KRUN_HINT, "snapshot", "create", name, "--memory", "--name", "refused-memory")
-        _refused(silo, name, f"fork unsupported: {reason}", KRUN_HINT, "fork", name, "--live", "--name", "refused-live")
-        _refused(silo, name, f"capture unsupported: {reason}", KRUN_HINT, "hibernate", name)
-        assert silo.exec(name, "true").returncode == 0, "refusals must leave the guest reachable"
+@pytest.mark.krun_live
+def test_krun_memory_snapshot_restore_fork_hibernate_and_wake(silo: Silo, basic_image: str) -> None:
+    source, restored, forked = "live-source", "live-restored", "live-forked"
+    hibernate.create(silo, basic_image, source)
+    original = silo.info(source)
+    boot = hibernate.boot_id(silo, source)
+    marker = "/dev/shm/macos-live-marker"
+    silo.exec(source, "sh", "-ec", f"printf live-cut >{marker}", user="root")
 
-        resumed = silo.run("resume", name, expect=None)
-        assert resumed.returncode != 0
-        assert resumed.stderr.strip() == f"error: machine `{name}` is not paused", resumed.stderr
-        assert silo.info(name)["state"] == "running"
-    finally:
+    def check_running(name: str) -> dict:
+        info = silo.wait_ready(name)
+        assert info["state"] == "running"
+        assert silo.exec(name, "cat", marker).stdout == "live-cut"
+        assert hibernate.boot_id(silo, name) == boot
+        before = time.time()
+        guest = int(silo.exec(name, "date", "+%s").stdout)
+        after = time.time()
+        assert before - 3 <= guest <= after + 3, (name, before, guest, after)
+        return info
+
+    saved = silo.json("snapshot", "create", source, "--memory", "--name", "macos-live-cut", timeout=240)
+    assert saved["snapshot"]["memory"] == "included"
+    assert check_running(source)["run_id"] == original["run_id"]
+    restore.restore(silo, "macos-live-cut", restored, expect=0)
+    assert check_running(restored)["id"] != original["id"]
+
+    silo.ws.register_machine(forked)
+    fork = silo.json("fork", source, "--live", "--name", forked, timeout=240)
+    assert fork["children"][0]["outcome"]["kind"] == "running"
+    assert check_running(forked)["id"] != original["id"]
+    assert check_running(source)["run_id"] == original["run_id"]
+
+    silo.run("hibernate", source, timeout=240)
+    assert silo.info(source)["state"] == "hibernated"
+    silo.start(source)
+    awake = check_running(source)
+    assert awake["id"] == original["id"] and awake["run_id"] != original["run_id"]
+
+    for name in (restored, forked, source):
         silo.stop(name)
+        silo.rm(name)
+    silo.run("snapshot", "rm", "macos-live-cut")
 
 
 def test_vz_refuses_everything_beyond_the_basic_lifecycle(silo: Silo, basic_image: str) -> None:

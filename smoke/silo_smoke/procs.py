@@ -72,6 +72,39 @@ def krun_workers(monitor: int) -> list[int]:
     return workers
 
 
+
+class _ProcBsdInfo(ctypes.Structure):
+    """Darwin's proc_bsdinfo from <sys/proc_info.h>."""
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("identity", ctypes.c_uint32 * 10),
+        ("comm", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+        ("details", ctypes.c_uint32 * 6),
+        ("start_seconds", ctypes.c_uint64),
+        ("start_microseconds", ctypes.c_uint64),
+    ]
+
+
+def darwin_birth(pid: int) -> tuple[int, int] | None:
+    """Kernel birth time; a missing or zombie process has no live identity."""
+    kernel_query = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+    kernel_query.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    kernel_query.restype = ctypes.c_int
+    info = _ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    copied = kernel_query(pid, 3, 0, ctypes.byref(info), size)  # PROC_PIDTBSDINFO
+    if copied == 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise OSError(error, os.strerror(error), pid)
+    assert copied == size, (pid, copied, size)
+    if info.status == 5:  # SZOMB
+        return None
+    return info.start_seconds, info.start_microseconds
+
 def executable_path(pid: int) -> Path:
     """Executable selected by the kernel, not the process's mutable argv."""
     if platform.system() != "Darwin":

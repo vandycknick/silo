@@ -19,7 +19,7 @@ import time
 import pytest
 
 from silo_smoke import native_live_launch, prereqs, shutdown
-from silo_smoke.native_live_api import cleanup_session, make_session_type
+from silo_smoke.native_live_api import assert_writers_closed, cleanup_session, make_session_type
 from silo_smoke.native_live_trace import _record_restore_wait
 
 
@@ -545,6 +545,17 @@ os.write(4, json.dumps(result).encode())
     assert result["args"] == (["--restore"] if restoring else [])
     assert result["config"].get("cpus") == (3 if restoring else None)
     assert result["config"]["restore"] == (str(tmp_path) if restoring else None)
+
+
+@pytest.mark.macos_only
+def test_native_output_writer_observer_reports_held_descriptor(tmp_path: Path) -> None:
+    output = tmp_path / "memory.ram"
+    output.touch()
+    with output.open("rb"):
+        assert_writers_closed(os.getpid(), tmp_path)
+    with output.open("r+b"), pytest.raises(ValueError, match="retains writable output descriptor"):
+        assert_writers_closed(os.getpid(), tmp_path)
+
 
 if __name__ == "__main__":
     unittest.main()

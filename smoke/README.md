@@ -282,8 +282,9 @@ resume. It checks frozen workload evidence, user-owned authority, fresh-manager
 reconciliation, exact replay and GetOperation, stale-token and paused-cancel
 refusal, fenced new execution, unchanged boot/run identity and reseed count,
 and the exact generation acknowledgement. A second pause is stopped without
-resuming on both hosts. A Linux-only sibling uses procfs and pidfds to pin the
-actual paused-run storage owners, wait for their exit and check lease release.
+resuming on both hosts. A sibling pins the actual paused-run storage owners
+with procfs and pidfds on Linux or libproc and kqueue on macOS, waits for their
+exit and checks lease release.
 An uncontained handoff is rejected before allocating a live command.
 
 `live_acceptance` is a standalone Rust public-API consumer, not a VM-starting
@@ -292,7 +293,7 @@ runtime files and environment variables do not grant capabilities.
 
 ### Contained image init (Phase 29)
 
-`tests/test_contained_init.py` is a Linux-only slow real-VM module. It boots
+`tests/test_contained_init.py` has slow real-VM cases for Linux and macOS krun. It boots
 `ghcr.io/vandycknick/archlinux:latest` with systemd and
 `docker.io/library/alpine:latest` with busybox init. The OpenRC cases install
 `openrc busybox-openrc` into their own Alpine VM, enable cgroups and crond,
@@ -594,8 +595,8 @@ unchanged. Traced cases use the existing `stopped_trace` controller through
 ### Host memory reclaim (Phase 26)
 
 `tests/test_reclaim.py` runs the host memory reclaim scenarios against real Linux/KVM
-workers. It uses the same `linux_only` and `slow` markers as capture, restore,
-fork and incremental suites, and parametrizes both raw and layered guest roots.
+workers. The cases are Linux-only, slow and serial, and cover both raw and
+layered guest roots.
 The ordinary workspace uses the Cargo target filesystem. To exercise ext4, point the
 stopped-lane variables at an actual mounted writable ext4 directory;
 all machine disks, snapshot RAM and catalog bytes stay on that mount, while
@@ -890,8 +891,9 @@ Home and never removes machines from another Home.
 Host targets are `linux-amd64-gnu`, `linux-arm64-gnu` and `darwin-arm64`.
 
 Markers: `daemon` starts a private daemon; `system` needs the appliance image;
-`linux_only` and `macos_only` select host-specific
-checks. The default selection excludes `slow`; `make smoke SMOKE_ARGS='-m slow'`
+`linux_only` and `macos_only` select host-specific checks; `krun_live` selects
+portable checks for Linux and Apple Silicon with krun. The default selection
+excludes `slow`; `make smoke SMOKE_ARGS='-m slow'`
 overrides it to run extended checks. An explicit marker expression replaces the
 default, so use `-m 'not daemon and not slow'` to retain the fast selection while
 excluding daemon tests. `live` tests require explicit selection with `-m live`.
@@ -916,19 +918,23 @@ select vz.
 
 The Apple Silicon HVF lane covers raw and layered OCI boot, exec/TTY and
 file transfer, overlay persistence and worker descriptor modes, stop/restart,
-stopped snapshot/fork/restore, resident pause/resume, the loopback registry,
-image cache, network policy/forwarding and private daemon management.
+stopped snapshot/fork/restore and handoff, resident pause/resume, memory
+snapshots and restore, live fork, incremental capture, and hibernate/wake.
+It also covers the loopback registry, image cache, network policy/forwarding
+and private daemon management. The CLI acceptance case checks a RAM-only
+marker, preserved boot identity, guest clock and source continuity.
 Guest-side `/proc`, cgroup and mount checks still run in the Linux guest.
-Host worker observations use the stock macOS `pgrep`, `ps`, and `lsof`;
-the candidate also reads the worker executable path from libproc.
+Host observations use macOS `pgrep`, `ps`, `lsof`, libproc and kqueue.
 The candidate `upper-symlink` fault needs e2fsprogs `debugfs` on PATH to mutate
 and verify the ext4 image offline; only that parameter skips if it is absent.
 
-Live memory capture, restore, fork and hibernation are not available on macOS.
-Resident pause/resume does not require memory capture. The Linux-only crash,
-syscall and shutdown-certification lanes keep their pidfd, ptrace, inotify,
-subreaper and host filesystem oracles. The pinned Distribution binary has no
-macOS release, independent of the portable loopback-registry tests.
+For guest probes that compile C, install Zig or set `CC` to a compiler
+that produces static Linux arm64 binaries. Managed ext4 data fixtures and
+offline ext4 disk observations need `mkfs.ext4` and `debugfs` from e2fsprogs
+on PATH. The Linux-only cases retain their pidfd signaling, ptrace, KVM,
+subreaper, host filesystem and `/proc/*/smaps` oracles. The pinned
+Distribution binary has no macOS release. VZ still refuses snapshots,
+forks, restore and live operations.
 
 ### Default-suite cost strategy
 
@@ -1678,9 +1684,9 @@ The raw and layered never-started refusal cases run there: the machine must
 refuse live fork, a memory snapshot and a missing restore without catalog or
 file effects. The fixture's seeded image-only catalog check runs there too.
 `tests/test_raw_live.py` adds a never-started raw-root snapshot, fork and restore
-with independent byte and inode checks. Cases that need pidfds, procfs,
-the child subreaper, the x86_64 ptrace controller, a host ext4 mount, or
-memory capture remain Linux-only.
+with independent byte and inode checks, as well as memory snapshots and live
+restore/fork. Cases that need exact pidfd signaling, the child subreaper, the
+x86_64 ptrace controller or a host ext4 mount remain Linux-only.
 
 `tests/test_native_capabilities.py` owns real machine-less native queries,
 including invalid launch descriptors, immutable build binding and mutable-grant
@@ -1985,11 +1991,11 @@ SILO_SMOKE_HIBERNATE_SLEEP=180 make smoke SMOKE_AREAS=hibernate SMOKE_MARK= \
   SMOKE_ARGS='-k wall_clock'
 ```
 
-The `hibernate` area is Linux-only and slow. Its child-only syscall crash
-controller additionally requires x86_64, like the existing capture controller.
-It uses the real CLI, ordinary private Homes, existing execution witnesses,
-managed/external disk fixtures and pidfd process ownership. No fault result or
-saved state is fabricated. Collection never starts guests.
+The `hibernate` area is slow and covers Linux and macOS arm64 krun. Linux-only
+cases retain the x86_64 live-register witness, pidfd process signaling, or
+child-only syscall crash controller. The suite uses the real CLI, private
+Homes and managed/external disk fixtures. No fault result or saved state is
+fabricated. Collection never starts guests.
 
 | ADR conformance item | Scenario in `tests/test_hibernate.py` (unless noted) |
 | --- | --- |

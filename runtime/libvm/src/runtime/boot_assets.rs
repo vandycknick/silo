@@ -496,17 +496,13 @@ impl CaptureLane {
         }
     }
 
-    /// Stopped capture only clones stored files, so it runs wherever krun
-    /// direct boot does. Live capture needs the native memory path, which is
-    /// Linux only.
-    fn host_admitted(self) -> bool {
-        match self {
-            Self::Stopped => cfg!(any(
-                target_os = "linux",
-                all(target_os = "macos", target_arch = "aarch64")
-            )),
-            Self::Live => cfg!(target_os = "linux"),
-        }
+    /// Both lanes admit Linux and Apple silicon macOS. Live operations also
+    /// require native capability admission.
+    fn host_admitted() -> bool {
+        cfg!(any(
+            target_os = "linux",
+            all(target_os = "macos", target_arch = "aarch64")
+        ))
     }
 }
 
@@ -533,7 +529,7 @@ pub(crate) fn validate_captured_boot_lane(
             lane.label()
         )));
     }
-    if !lane.host_admitted() {
+    if !CaptureLane::host_admitted() {
         return Err(invalid_capture(format!(
             "{} boot capture is not admitted on this host",
             lane.label()
@@ -1661,16 +1657,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_lanes_are_admitted_per_host() {
-        use crate::runtime::boot_assets::CaptureLane as Lane;
-
-        let linux = cfg!(target_os = "linux");
-        let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-        assert_eq!(Lane::Stopped.host_admitted(), linux || apple_silicon);
-        assert_eq!(Lane::Live.host_admitted(), linux);
-    }
-
-    #[test]
     fn captured_boot_lane_refuses_mock_and_admits_krun_per_host() {
         let storage = crate::MachineStorageRecord::opaque_raw(
             crate::PrivatePath::new("root.raw").unwrap(),
@@ -1683,27 +1669,7 @@ mod tests {
                 validate_captured_boot_lane(&storage, vm_spec::live::LiveBackend::Mock, lane)
                     .is_err()
             );
-        }
-        validate_captured_boot_lane(
-            &storage,
-            vm_spec::live::LiveBackend::Krun,
-            CaptureLane::Stopped,
-        )
-        .unwrap();
-        // Live capture needs the native memory path, which only Linux has.
-        let live = validate_captured_boot_lane(
-            &storage,
-            vm_spec::live::LiveBackend::Krun,
-            CaptureLane::Live,
-        );
-        if cfg!(target_os = "linux") {
-            live.unwrap();
-        } else {
-            assert!(matches!(
-                live,
-                Err(crate::LibVmError::InvalidStorageRecord { message, .. })
-                    if message == "live boot capture is not admitted on this host"
-            ));
+            validate_captured_boot_lane(&storage, vm_spec::live::LiveBackend::Krun, lane).unwrap();
         }
     }
 
@@ -2067,13 +2033,7 @@ mod tests {
                 CaptureLane::Stopped
             )
             .is_ok());
-            // Linux refuses the partitioned root in the live root table; other
-            // hosts refuse live capture before reaching it.
-            let live_refusal = if cfg!(target_os = "linux") {
-                "no admitted live capture lane"
-            } else {
-                "live boot capture is not admitted on this host"
-            };
+            // Both admitted hosts refuse partitioned roots in the live lane.
             assert!(matches!(
                 validate_captured_boot_lane(
                     &storage,
@@ -2081,7 +2041,7 @@ mod tests {
                     CaptureLane::Live
                 ),
                 Err(crate::LibVmError::InvalidStorageRecord { message, .. })
-                    if message.contains(live_refusal)
+                    if message.contains("no admitted live capture lane")
             ));
             // Partitioned stopped capture still requires the krun backend.
             assert!(validate_captured_boot_lane(

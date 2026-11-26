@@ -9,9 +9,9 @@ from silo_smoke import capture_multidisk as multidisk
 from silo_smoke import fork, incremental, reclaim, restore, shutdown, stopped
 from silo_smoke.catalog_observer import observe
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
-from silo_smoke.filesystem import reflink_probe
+from silo_smoke.filesystem import disk_clone_probe
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
+pytestmark = [pytest.mark.krun_live, pytest.mark.slow, pytest.mark.serial]
 SOURCE = "unhashed-source"
 
 
@@ -80,7 +80,7 @@ def test_source_snapshot_retains_dirty_union_after_three_unhashed_forks(
 ) -> None:
     pages = create(silo, incremental_image, profile, data, external=external)
     mark(silo, SOURCE, "baseline", data)
-    reclaim.settled(silo, SOURCE)
+    reclaim.settle_before_capture(silo, SOURCE)
     baseline = restore.checkpoint(silo, SOURCE, alias="unhashed-baseline")
     incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")
     children = []
@@ -106,7 +106,7 @@ def test_source_snapshot_retains_dirty_union_after_three_unhashed_forks(
     incremental.full_file_oracle(silo, saved)
     assert facts["stats"]["identityBytesHashed"] < facts["stats"]["logicalBytes"] // 4, facts
     disk_stats = saved.seal["diskStats"]
-    if reflink_probe(saved.staging)["reflink"]:
+    if disk_clone_probe(saved.staging)["reflink"]:
         managed = disk_stats[:-1] if external else disk_stats
         assert all(disk["baselineReused"] and incremental.disk_full_scan_reason(disk) is None
                    for disk in managed), disk_stats

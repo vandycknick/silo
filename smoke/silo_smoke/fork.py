@@ -467,6 +467,9 @@ def stop_and_remove(silo: Silo, names: list[str]) -> None:
 # -- processes ------------------------------------------------------------------
 
 def _cmdline(pid: int) -> str:
+    if sys.platform == "darwin":
+        return subprocess.run(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
     return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
 
 
@@ -478,6 +481,24 @@ def vm_processes(silo: Silo) -> dict[int, str]:
     """Monitors whose arguments name this workspace, plus their krun workers."""
     roots = {str(silo.ws.root), str(silo.ws.run_root), str(silo.ws.silo_home)}
     found: dict[int, str] = {}
+    if sys.platform == "darwin":
+        listing = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,state=,command="],
+                                 capture_output=True, check=True, text=True, timeout=5)
+        for line in listing.stdout.splitlines():
+            fields = line.split(maxsplit=2)
+            if len(fields) != 3:
+                continue
+            pid_text, state, command = fields
+            if state.startswith("Z") or not any(root in command for root in roots):
+                continue
+            pid = int(pid_text)
+            try:
+                if procs.executable_path(pid).name == "silo-vmm":
+                    found[pid] = "silo-vmm"
+                    found.update((worker, "krun") for worker in procs.krun_workers(pid))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+        return found
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue

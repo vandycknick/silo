@@ -2,6 +2,8 @@
 
 Date: 2026-11-21
 
+Updated: 2026-11-26
+
 ## Status
 
 Accepted
@@ -12,6 +14,12 @@ builds on [ADR 0021](0021-live-snapshots-and-forks.md) for capture, restore
 construction and activation, on
 [ADR 0014](0014-layered-oci-image-storage.md) for storage ownership, and on
 [ADR 0018](0018-silo-vmm-contract.md) for the monitor contract.
+
+The 2026-11-26 revision delivers hibernate and wake on krun with HVF on
+macOS arm64. That lane reports native pause, capture, restore, fork and
+incremental support under ADR 0021. The macOS 26 floor and machine
+admission checks still apply; macOS 27 is unqualified. VZ is unchanged
+and refuses hibernation and live operations.
 
 ## The Problem
 
@@ -363,6 +371,12 @@ Wake applies the ADR 0021 restore compatibility checks before consume. Saved
 state is not tied to an exact Silo build. A host kernel, firmware or Silo
 update between hibernate and wake can cause a refusal; the machine stays
 hibernated and the user discards.
+
+On HVF, preflight checks destination compatibility facts without starting
+a VM. Installation of the opaque GIC state can still fail during real
+wake construction, before consume. On macOS the native RAM path has no
+RAM clone or hole punching, so writing a save can take longer and allocate
+more space than the optimized Linux path.
 
 The guest agent embedded in a machine's boot assets must support same-machine
 activation. Hibernate refuses a machine whose agent does not, because the

@@ -26,7 +26,7 @@ from silo_smoke.workspace import Workspace
 # The overlay-probe image fixture stays owned by its existing module.
 from .test_stopped import stopped_image
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.daemon]
+pytestmark = [pytest.mark.krun_live, pytest.mark.daemon]
 
 RESOURCES = ("--cpus", "1", "--memory", "512mib", "--disk-size", "512mib", "--network", "none", "--vsock")
 OWNED = {"state": "owned"}

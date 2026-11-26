@@ -97,14 +97,8 @@ def boot_process(silo: Silo, name: str) -> BootProcess:
     return BootProcess(pid, start_ticks, command)
 
 
-def holders(silo: Silo, name: str) -> list[shutdown.Process]:
-    value, _ = shutdown.holder(silo, name)
-    return [shutdown.Process(entry["pid"]) for entry in value["holders"]]
-
-
 def save(silo: Silo, name: str) -> None:
-    processes = holders(silo, name)
-    try:
+    with shutdown.observe_holders(silo, name) as (_, _, processes):
         result = silo.run("hibernate", name, timeout=240)
         assert result.stdout == "", result
         assert re.search(rf"✓ Hibernated\s+{re.escape(name)}\b", result.stderr), result
@@ -112,9 +106,6 @@ def save(silo: Silo, name: str) -> None:
             process.wait()
         saved_files(silo, name)
         assert silo.info(name)["state"] == "hibernated"
-    finally:
-        for process in processes:
-            process.close()
 
 
 def wake(silo: Silo, name: str) -> str:

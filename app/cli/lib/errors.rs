@@ -97,12 +97,15 @@ pub(crate) fn native_message(error: &libvm::LibVmError) -> String {
 }
 
 fn live_refusal(value: &vm_spec::live::LiveOperationUnsupported) -> String {
-    let alternative = if value.backend == vm_spec::live::LiveBackend::Vz {
-        "snapshots, forks and live operations need the krun backend"
-    } else {
-        "use silo stop, then a snapshot without memory"
-    };
-    format!("{value}; {alternative}")
+    use vm_spec::live::{LiveBackend, LiveLane};
+
+    match (value.backend, value.lane) {
+        (LiveBackend::Vz, _) => {
+            format!("{value}; snapshots, forks and live operations need the krun backend")
+        }
+        (LiveBackend::Krun, LiveLane::HvfArm64) => value.to_string(),
+        _ => format!("{value}; use silo stop, then a snapshot without memory"),
+    }
 }
 
 #[cfg(test)]
@@ -135,12 +138,12 @@ mod tests {
     }
 
     #[test]
-    fn non_vz_refusal_suggests_a_stopped_snapshot() {
+    fn other_lane_refusals_suggest_a_stopped_snapshot() {
         use vm_spec::live::{LiveBackend, LiveLane, LiveOperation, LiveOperationUnsupported};
         use vm_spec::live::{LiveReasonCode, LiveUnsupportedReason};
 
         for (backend, lane) in [
-            (LiveBackend::Krun, LiveLane::HvfArm64),
+            (LiveBackend::Krun, LiveLane::KvmArm64GicV3),
             (LiveBackend::Mock, LiveLane::NotApplicable),
         ] {
             let line = crate::errors::live_refusal(&LiveOperationUnsupported {
@@ -150,6 +153,27 @@ mod tests {
                 reason: LiveUnsupportedReason::new(LiveReasonCode::BuildExcluded),
             });
             assert!(line.ends_with("; use silo stop, then a snapshot without memory"));
+        }
+    }
+
+    #[test]
+    fn hvf_refusal_reports_the_reason_without_a_stopped_snapshot_hint() {
+        use vm_spec::live::{
+            LiveBackend, LiveLane, LiveOperation, LiveOperationUnsupported, LiveReasonCode,
+            LiveUnsupportedReason,
+        };
+
+        for reason in [
+            LiveUnsupportedReason::new(LiveReasonCode::HostOsBelowFloor),
+            LiveUnsupportedReason::new(LiveReasonCode::HypervisorUnavailable),
+        ] {
+            let refusal = LiveOperationUnsupported {
+                operation: LiveOperation::Capture,
+                backend: LiveBackend::Krun,
+                lane: LiveLane::HvfArm64,
+                reason,
+            };
+            assert_eq!(crate::errors::live_refusal(&refusal), refusal.to_string());
         }
     }
 

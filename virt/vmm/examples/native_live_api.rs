@@ -68,7 +68,7 @@ mod native_stream_map;
 #[path = "native_live_api/entry.rs"]
 mod entry;
 
-fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<std::process::ExitCode> {
     #[cfg(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64")

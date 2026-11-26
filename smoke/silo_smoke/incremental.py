@@ -9,6 +9,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -33,8 +34,10 @@ def incremental_image(config: SmokeConfig, registry: LoopbackRegistry,
     """Use the existing execution oracle plus a pinned CPU/block-DMA witness."""
     directory = tmp_path_factory.mktemp("incremental-probes")
     files = dict(images.BASIC.files)
-    for source, destination in ((REPO / "smoke/fixtures/incremental_memory.c", PROBE),
-                                (REPO / "virt/vmm/tests/guest/restore_execution.c", restore.PROBE)):
+    probes = [(REPO / "smoke/fixtures/incremental_memory.c", PROBE)]
+    if sys.platform != "darwin":
+        probes.append((REPO / "virt/vmm/tests/guest/restore_execution.c", restore.PROBE))
+    for source, destination in probes:
         executable = directory / Path(destination).name
         command = [*toolchain.static_cc(), "-static", "-O2", "-pthread",
                    "-Wall", "-Wextra", "-Werror", "-std=c11", str(source), "-o", str(executable)]
@@ -150,11 +153,13 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
     assert stats["identityBytesHashed"] == hashed
     probe = None
     if mode == "incremental":
-        probe = reflink_probe(saved.staging)
-        assert stats["seedMethod"] == ("clone" if probe["reflink"] else "rebuild"), (stats, probe)
+        # Native RAM seeding uses Linux FICLONE, independent of Darwin disk clones.
+        probe = reflink_probe(saved.staging) if sys.platform == "linux" else None
+        clone_seed = probe is not None and probe["reflink"]
+        assert stats["seedMethod"] == ("clone" if clone_seed else "rebuild"), (stats, probe)
         assert stats["fullBytesWritten"] == 0
         assert stats["overlayBytesWritten"] <= stats["liveBytesRead"] <= coverage <= length
-        if probe["reflink"]:
+        if clone_seed:
             # Every selected identity-unit byte is either read or proven absent.
             # Output zero runs/punches overlap those bytes and are not read savings.
             assert stats["liveBytesRead"] + stats["knownZeroBytesSkipped"] == coverage, stats
@@ -170,7 +175,12 @@ def authenticated_map(silo: Silo, saved: restore.Checkpoint, *, mode: str,
             assert all(stats[field] == 0 for field in (
                 "baselineBytesRead", "baselineBytesWritten", "baselineHoleBytes", "extentQueries"))
         else:
-            assert stats["liveBytesRead"] == stats["overlayBytesWritten"]
+            unwritten = stats["liveBytesRead"] - stats["overlayBytesWritten"]
+            if sys.platform == "darwin":
+                # Dirty pages that read back as zero are covered as zero runs, not written.
+                assert unwritten <= stats["zeroRunBytesCovered"], stats
+            else:
+                assert unwritten == 0, stats
     else:
         assert stats["seedMethod"] == "rebuild"
         assert stats["liveBytesRead"] + stats["knownZeroBytesSkipped"] == length

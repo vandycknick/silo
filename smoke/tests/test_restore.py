@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import time
 
 import pytest
@@ -16,7 +17,7 @@ from silo_smoke import capture, incremental, overlay, pause, procs, reclaim, res
 from silo_smoke.cli import ROOT_PROFILES, Result, RootProfile, Silo
 from silo_smoke.restore import restore_irq_fixture  # noqa: F401, pytest fixture
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = pytest.mark.slow
 
 
 @pytest.fixture
@@ -77,42 +78,46 @@ def marker(silo: Silo, name: str) -> str:
     return silo.exec(name, "cat", "/restore-private").stdout.strip()
 
 
+@pytest.mark.krun_live
 def test_restore_inspection_rejects_writable_state_descriptors(
-    silo: Silo, restore_image: str, restore_processes: list[shutdown.Process],
+    silo: Silo, request: pytest.FixtureRequest,
 ) -> None:
     """Inspection emits one typed refusal, not a success report, for writable FDs."""
     inspection_version = 1
+    restore_image, processes = refusal_inputs(request)
     restore.create_source(silo, restore_image, profile="layered")
-    own(silo, "restore-source", restore_processes)
+    if processes is not None:
+        own(silo, "restore-source", processes)
     saved = restore.checkpoint(silo, "restore-source")
     child = restore.restore_child(silo, saved, "inspection-source")
-    own(silo, "inspection-source", restore_processes)
+    if processes is not None:
+        own(silo, "inspection-source", processes)
     records = procs.query(
         silo.ws.state_db(),
         "SELECT json(record_json) FROM storage_operation WHERE kind='launch'",
     )
     retained = next(json.loads(row[0]) for row in records
                     if json.loads(row[0])["machineId"] == child["id"])
-    request = retained["restore"]["request"]
+    restore_request = retained["restore"]["request"]
     paths = {(path.stat().st_dev, path.stat().st_ino): path
              for path in restore.closure_paths(silo, saved)}
-    ram = request["objects"][0]
+    ram = restore_request["objects"][0]
     copied = silo.ws.root / "inspection-ram"
-    subprocess.run(["cp", "--reflink=auto", "--sparse=always",
-                    str(paths[(ram["fileDevice"], ram["fileInode"])]), str(copied)],
+    copy = ["/bin/cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=auto", "--sparse=always"]
+    subprocess.run([*copy, str(paths[(ram["fileDevice"], ram["fileInode"])]), str(copied)],
                    check=True, timeout=30)
     copied.chmod(0o600)
 
     def inspect(writable: bool) -> subprocess.CompletedProcess[str]:
         with ExitStack() as stack:
             descriptors = []
-            for index, entry in enumerate(request["objects"]):
+            for index, entry in enumerate(restore_request["objects"]):
                 path = copied if index == 0 else paths[(entry["fileDevice"], entry["fileInode"])]
                 file = stack.enter_context(path.open("r+b" if writable and index == 0 else "rb"))
                 stat = os.fstat(file.fileno())
                 entry.update(fd=file.fileno(), fileDevice=stat.st_dev, fileInode=stat.st_ino)
                 descriptors.append(file.fileno())
-            encoded = json.dumps({"version": inspection_version, "restore": request, "network": False}) + "\n"
+            encoded = json.dumps({"version": inspection_version, "restore": restore_request, "network": False}) + "\n"
             result = subprocess.run(
                 [str(silo.ws.config.runtime_dir / "bin/silo-vmm"), "inspect-restore"],
                 input=encoded, text=True, capture_output=True,
@@ -140,12 +145,13 @@ def test_restore_inspection_rejects_writable_state_descriptors(
     report = json.loads(accepted.stdout)
     assert report["version"] == inspection_version and "refusal" not in report, report
     assert report["authority"] == {
-        "kind": "identified-snapshot", "snapshot": request["authority"]["snapshot"],
+        "kind": "identified-snapshot", "snapshot": restore_request["authority"]["snapshot"],
     }, report
-    stop_owned(silo, "inspection-source", restore_processes)
-    stop_owned(silo, "restore-source", restore_processes)
+    stop_refusal_source(silo, "inspection-source", processes)
+    stop_refusal_source(silo, "restore-source", processes)
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("borrowed", [False, True], ids=["acquired-freeze", "borrowed-freeze"])
 def test_restore_execution_continues_exact_cut_and_isolates_siblings(
@@ -310,13 +316,35 @@ def refused_before_allocation(silo: Silo, reference: str, name: str, *,
 def checkpoint_for_policy(silo: Silo, policy: str) -> restore.Checkpoint:
     if policy == "full":
         return restore.checkpoint(silo, "restore-source")
-    reclaim.settled(silo, "restore-source")
+    reclaim.settle_before_capture(silo, "restore-source")
     baseline = restore.checkpoint(silo, "restore-source", alias="restore-baseline")
     silo.run("resume", "restore-source")
     silo.exec("restore-source", "sh", "-eu", "-c", "printf incremental >/dev/shm/incremental-negative", user="root")
     saved = restore.checkpoint(silo, "restore-source", policy="incremental")
     incremental.authenticated_map(silo, saved, mode="incremental", baseline=baseline)
     return saved
+
+
+def refusal_inputs(request: pytest.FixtureRequest) -> tuple[str, list[shutdown.Process] | None]:
+    if sys.platform == "darwin":
+        return request.getfixturevalue("basic_image"), None
+    return request.getfixturevalue("restore_image"), request.getfixturevalue("restore_processes")
+
+
+def start_refusal_checkpoint(silo: Silo, request: pytest.FixtureRequest, profile: RootProfile,
+                             policy: str) -> tuple[restore.Checkpoint, list[shutdown.Process] | None]:
+    image, processes = refusal_inputs(request)
+    restore.create_source(silo, image, profile=profile)
+    if processes is not None:
+        own(silo, "restore-source", processes)
+    return checkpoint_for_policy(silo, policy), processes
+
+
+def stop_refusal_source(silo: Silo, name: str, processes: list[shutdown.Process] | None) -> None:
+    if processes is None:
+        stopped.stop(silo, name, require_clean=False)
+    else:
+        stop_owned(silo, name, processes)
 
 
 # Execution members are root-independent; the root stream is exercised for
@@ -329,18 +357,16 @@ CLOSURE_CASES = ([("layered", member) for member in (*EXECUTION_MEMBERS, *COMPOS
                  + [("raw", "root")])
 
 
+@pytest.mark.krun_live
 @pytest.mark.parametrize("policy", ["full", "incremental"])
 @pytest.mark.parametrize(("profile", "member"), CLOSURE_CASES,
                          ids=[f"{profile}-{member}" for profile, member in CLOSURE_CASES])
 def test_restore_corrupt_real_closure_refuses_before_child_allocation(
-    silo: Silo, restore_image: str, profile: RootProfile, member: str, policy: str,
-    restore_processes: list[shutdown.Process],
+    silo: Silo, request: pytest.FixtureRequest, profile: RootProfile, member: str, policy: str,
 ) -> None:
-    restore.create_source(silo, restore_image, profile=profile)
-    own(silo, "restore-source", restore_processes)
-    saved = checkpoint_for_policy(silo, policy)
+    saved, processes = start_refusal_checkpoint(silo, request, profile, policy)
     record = restore.snapshot_record(silo, saved)
-    stop_owned(silo, "restore-source", restore_processes)
+    stop_refusal_source(silo, "restore-source", processes)
     shutdown.storage_tool(silo, "prune")
     execution = record["execution"]
     stream_members = {"ram": execution["memory"]["stream"], "root": record["root"]["stream"]["stream"]}
@@ -400,6 +426,7 @@ def test_restore_corrupt_real_closure_refuses_before_child_allocation(
         path.chmod(mode)
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("policy", ["full", "incremental"])
 @pytest.mark.parametrize("mutation", ["cpu", "profile", "schema", "architecture", "xsave", "tsc-rate", "msr"])
 def test_restore_real_native_incompatibility_refuses_before_child_allocation(
@@ -421,13 +448,12 @@ def test_restore_real_native_incompatibility_refuses_before_child_allocation(
     shutdown.storage_tool(silo, "prune")
 
 
+@pytest.mark.krun_live
 def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
-    silo: Silo, restore_image: str, restore_processes: list[shutdown.Process],
+    silo: Silo, request: pytest.FixtureRequest,
 ) -> None:
-    restore.create_source(silo, restore_image, profile="layered")
-    own(silo, "restore-source", restore_processes)
-    saved = restore.checkpoint(silo, "restore-source")
-    stop_owned(silo, "restore-source", restore_processes)
+    saved, processes = start_refusal_checkpoint(silo, request, "layered", "full")
+    stop_refusal_source(silo, "restore-source", processes)
     shutdown.storage_tool(silo, "prune")
     result = refused_before_allocation(
         silo, saved.reference, "restore-wrong-backend",
@@ -436,6 +462,7 @@ def test_restore_selected_vz_backend_rejects_before_any_operational_allocation(
     assert "snapshots, forks and live operations need the krun backend" in result.stderr, result.stderr
 
 
+@pytest.mark.linux_only
 @pytest.mark.skipif(platform.machine().lower() not in {"x86_64", "amd64"}, reason="hardware IRQ witness is x86_64 assembly")
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_restore_pending_hardware_irq_continues_exactly_once(

@@ -51,7 +51,7 @@ def test_native_capabilities_machine_less_binding_and_no_mutable_grants(config: 
     assert report["lane"] in ("kvm-x86_64", "kvm-arm64-gicv3", "hvf-arm64")
     for operation in ("pause", "capture", "restore", "fork", "incremental"):
         capability = report["live"][operation]
-        assert capability["native"] is (report["lane"] == "kvm-x86_64" or operation == "pause")
+        assert capability["native"] is (report["lane"] in {"kvm-x86_64", "hvf-arm64"} or operation == "pause")
         expected = ({"status": "supported"} if capability["native"] else
                     {"status": "unsupported", "reason": {"code": "build-excluded", "subject": None}})
         assert capability["availability"] == expected

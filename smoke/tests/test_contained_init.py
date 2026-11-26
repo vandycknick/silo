@@ -11,7 +11,7 @@ from silo_smoke import contained_init as contained
 from silo_smoke import pause
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.usefixtures("pulled_images")]
+pytestmark = [pytest.mark.krun_live, pytest.mark.slow, pytest.mark.usefixtures("pulled_images")]
 
 
 @pytest.mark.parametrize("kind", contained.INIT_KINDS)
@@ -195,6 +195,7 @@ cat /proc/$pid/cgroup
     contained.contained(silo, name)
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("kind", contained.INIT_KINDS)
 def test_stop_syncs_image_init_writes_before_force_stop(silo: Silo, kind: str) -> None:
     name = "contained-stop"

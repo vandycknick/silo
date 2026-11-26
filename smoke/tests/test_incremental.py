@@ -14,7 +14,7 @@ from silo_smoke import contained_init as contained
 from silo_smoke.cli import Silo
 from silo_smoke.config import REPO
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = [pytest.mark.krun_live, pytest.mark.slow]
 SOURCE = "incremental-source"
 
 
@@ -31,7 +31,7 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
-    reclaim.settled(silo, SOURCE)
+    reclaim.settle_before_capture(silo, SOURCE)
     baseline = restore.checkpoint(silo, SOURCE, alias="fork-baseline")
     incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")
     source = silo.info(SOURCE)
@@ -54,7 +54,7 @@ def test_incremental_fork_preserves_pause_and_child_baseline(
 def test_scattered_writes_cover_expected_64k_leaves_and_preserve_owned_pages(silo: Silo, incremental_image: str) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
-    reclaim.settled(silo, SOURCE)
+    reclaim.settle_before_capture(silo, SOURCE)
     baseline = restore.checkpoint(silo, SOURCE, alias="scattered-64k-baseline")
     old = incremental.authenticated_map(silo, baseline, mode="full", reason="no-baseline")
     witness_indices = incremental.pages_at_cut(silo, baseline, initial)
@@ -80,6 +80,7 @@ def test_scattered_writes_cover_expected_64k_leaves_and_preserve_owned_pages(sil
         "expected64KiBLeaves": sorted(expected), "containingLeafChanges": sorted(changed),
     }, sort_keys=True) + "\n")
 
+@pytest.mark.linux_only(reason="requires the x86_64 live-register witness")
 def test_cpu_host_dma_zero_and_first_child_inherited_incremental(
     silo: Silo, incremental_image: str,
 ) -> None:
@@ -142,7 +143,7 @@ def test_observed_console_vsock_and_balloon_writes_match_frozen_full_ram(
     silo: Silo, incremental_image: str,
 ) -> None:
     create(silo, incremental_image)
-    reclaim.settled(silo, SOURCE)
+    reclaim.settle_before_capture(silo, SOURCE)
     base = restore.checkpoint(silo, SOURCE, alias="host-writers-baseline", policy="full")
     incremental.authenticated_map(silo, base, mode="full", reason="requested")
     baseline_reports = incremental.balloon_report_queue(silo, base)
@@ -219,7 +220,7 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
 ) -> None:
     create(silo, incremental_image)
     initial = incremental.witness(silo, SOURCE, "start")
-    reclaim.settled(silo, SOURCE)
+    reclaim.settle_before_capture(silo, SOURCE)
     base = restore.checkpoint(silo, SOURCE, alias="selection-full", policy="full")
     incremental.authenticated_map(silo, base, mode="full", reason="requested")
     silo.run("resume", SOURCE)
@@ -242,6 +243,7 @@ def test_full_request_lowered_crossover_and_new_worker_invalidate_baseline(
     incremental.authenticated_map(silo, cold, mode="full", reason="no-baseline")
 
 
+@pytest.mark.linux_only(reason="requires Linux x86_64 ptrace and KVM dirty-log syscalls")
 @pytest.mark.parametrize("boundary", ["capture-ram-write", "capture-dirty-harvest"],
                          ids=["abandoned-union", "post-effect-coverage-lost"])
 def test_capture_dirty_union_and_coverage_recovery(

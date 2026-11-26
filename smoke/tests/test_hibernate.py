@@ -6,6 +6,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +32,7 @@ from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.registry import LoopbackRegistry
 from silo_smoke.terminal import PtyCommand
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = [pytest.mark.krun_live, pytest.mark.slow]
 NAME = "hibernate-vm"
 
 
@@ -39,19 +40,23 @@ NAME = "hibernate-vm"
 def hibernate_image(config: SmokeConfig, registry: LoopbackRegistry,
                     tmp_path_factory: pytest.TempPathFactory) -> str:
     """Existing execution witness with an image-owned, non-Silo machine id."""
-    output = tmp_path_factory.mktemp("hibernate-probe") / "restore-execution"
-    subprocess.run([*toolchain.static_cc(), "-static", "-O2", "-pthread", "-Wall", "-Wextra", "-Werror",
-                    "-std=c11", str(REPO / "virt/vmm/tests/guest/restore_execution.c"), "-o", str(output)],
-                   capture_output=True, check=True, timeout=120)
+    probe = {}
+    if sys.platform != "darwin":
+        output = tmp_path_factory.mktemp("hibernate-probe") / "restore-execution"
+        subprocess.run([*toolchain.static_cc(), "-static", "-O2", "-pthread", "-Wall", "-Wextra", "-Werror",
+                        "-std=c11", str(REPO / "virt/vmm/tests/guest/restore_execution.c"), "-o", str(output)],
+                       capture_output=True, check=True, timeout=120)
+        probe[restore.PROBE.lstrip("/")] = images.GuestFile(output.read_bytes(), mode=0o755)
     spec = replace(images.BASIC, name="hibernate", files={
         **images.BASIC.files,
         "etc/machine-id": (hibernate.IMAGE_MACHINE_ID + "\n").encode(),
-        restore.PROBE.lstrip("/"): images.GuestFile(output.read_bytes(), mode=0o755),
+        **probe,
     })
     image = images.build(spec, images.fetch_alpine(config.cache_dir))
     return registry.publish(image, "hibernate")
 
 
+@pytest.mark.linux_only(reason="requires the x86_64 live-register witness")
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_process_memory_pid_boot_and_startup_survive_two_cycles(
     silo: Silo, hibernate_image: str, profile: RootProfile,
@@ -134,7 +139,8 @@ def test_stop_hibernated_then_cold_start(silo: Silo, basic_image: str, force: bo
     assert not directory.exists(), "discard/stop retained the unused save"
     if force:
         assert "Waking" not in result.stderr + result.stdout
-    else:
+    elif sys.platform == "linux":
+        # Clean-stop certification is recorded on Linux only.
         assert shutdown.outcome(silo, NAME) == "clean"
     silo.start(NAME)
     silo.wait_ready(NAME)
@@ -218,9 +224,10 @@ def test_every_saved_file_tamper_refuses_without_boot_then_plain_stop_discards(
                 output.truncate(0)
         else:
             replacement = path.with_suffix(path.suffix + ".replacement")
-            # GNU cp's sparse lane avoids materializing configured guest RAM.
-            subprocess.run(["cp", "--sparse=always", "--preserve=mode,timestamps", str(path), str(replacement)],
-                           check=True, capture_output=True, timeout=120)
+            # Preserve mode and timestamps without materializing sparse guest RAM.
+            copy = (["/bin/cp", "-c", "-p"] if sys.platform == "darwin" else
+                    ["cp", "--sparse=always", "--preserve=mode,timestamps"])
+            subprocess.run([*copy, str(path), str(replacement)], check=True, capture_output=True, timeout=120)
             replacement.replace(path)
         assert_unusable_then_discard(silo, "files are missing" if mutation == "delete" else "files were changed",
                                     old_boot, directory)
@@ -313,6 +320,7 @@ def test_twenty_concurrent_accesses_share_one_wake(silo: Silo, basic_image: str)
     assert hibernate.boot_id(silo, NAME) == boot
 
 
+@pytest.mark.linux_only(reason="requires pidfd signaling of independently discovered workspace processes")
 def test_hibernated_fresh_cli_without_silo_processes(silo: Silo, basic_image: str) -> None:
     """Conformance 11 surrogate only, not a reboot or Btrfs device-number test."""
     hibernate.create(silo, basic_image, NAME)

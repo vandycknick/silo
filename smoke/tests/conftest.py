@@ -80,15 +80,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def skip_unavailable(config: pytest.Config, items: list[pytest.Item]) -> None:
     system = platform.system()
     try:
-        system_image = smoke_config.resolve(config).system_image
+        resolved = smoke_config.resolve(config)
     except SmokeEnvironmentError:
-        system_image = None
+        resolved = None
+    system_image = resolved.system_image if resolved else None
+    macos_krun = (system == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}
+                  and resolved is not None and resolved.backend == "krun")
     for item in items:
         linux_only = item.get_closest_marker("linux_only")
         if linux_only and system != "Linux":
             item.add_marker(pytest.mark.skip(reason=linux_only.kwargs.get("reason", "requires Linux")))
         if item.get_closest_marker("macos_only") and system != "Darwin":
             item.add_marker(pytest.mark.skip(reason="requires macOS"))
+        if item.get_closest_marker("krun_live") and system != "Linux" and not macos_krun:
+            item.add_marker(pytest.mark.skip(reason="requires Linux or macOS arm64 with --backend krun"))
         if item.get_closest_marker("system") and system_image is None:
             item.add_marker(pytest.mark.skip(reason="SILO_SMOKE_SYSTEM_IMAGE is empty"))
 

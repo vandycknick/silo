@@ -32,7 +32,7 @@ from silo_smoke.config import REPO, SmokeConfig
 from silo_smoke.filesystem import reflink_probe
 from silo_smoke.registry import LoopbackRegistry
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow]
+pytestmark = pytest.mark.slow
 PROBE = "/usr/local/bin/capture-counter"
 NAME = "capture-lifecycle"
 FACTS = ("workloadsFrozen", "vcpusPaused", "devicesQuiesced", "hostWritersDrained",
@@ -304,6 +304,7 @@ def captured(silo: Silo, image: str, boundary: str, policy: str,
 
 
 @pytest.mark.parametrize("policy", ["resume", "preserve", "borrow"])
+@pytest.mark.linux_only
 def test_capture_manager_death_leaves_the_recorded_policy_to_the_monitor(
     silo: Silo, lifecycle_image: str, policy: str,
 ) -> None:
@@ -375,6 +376,7 @@ def test_capture_manager_death_leaves_the_recorded_policy_to_the_monitor(
 @pytest.mark.parametrize("boundary", [
     "capture-execution-write", "capture-cut-settle", "capture-record-settle",
 ])
+@pytest.mark.linux_only
 def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
     silo: Silo, lifecycle_image: str, boundary: str,
 ) -> None:
@@ -485,6 +487,7 @@ def test_capture_stop_racing_unsealed_or_sealed_capture_never_resumes(
         run.finish()
 
 
+@pytest.mark.linux_only
 def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_thaw(
     silo: Silo, lifecycle_image: str,
 ) -> None:
@@ -578,6 +581,7 @@ def test_capture_cancel_joined_at_the_seal_never_interrupts_resume_handshake_or_
         run.finish()
 
 
+@pytest.mark.linux_only
 def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unknown(
     silo: Silo, lifecycle_image: str,
 ) -> None:
@@ -646,6 +650,7 @@ def test_capture_absent_continuation_record_is_pending_while_run_lives_then_unkn
         run.finish()
 
 
+@pytest.mark.linux_only
 def test_checkpoint_publication_syncs_real_pool_fds_before_catalog_acknowledgment(
     silo: Silo, lifecycle_image: str,
 ) -> None:
@@ -697,6 +702,7 @@ def test_checkpoint_publication_syncs_real_pool_fds_before_catalog_acknowledgmen
                    for entry in successful), "catalog durability did not follow pool publication"
 
 
+@pytest.mark.linux_only
 def test_capture_genuine_continuation_failure_keeps_seal_and_fences_source(
     silo: Silo, lifecycle_image: str,
 ) -> None:
@@ -837,6 +843,7 @@ def exhausted_capture_budget(silo: Silo) -> Iterator[None]:
                 lease_path.unlink(missing_ok=True)
 
 
+@pytest.mark.krun_live
 @pytest.mark.serial
 def test_capture_budget_refusal_leaves_no_ownership_and_force_removal_works(
     silo: Silo, lifecycle_image: str,
@@ -872,6 +879,7 @@ def test_capture_budget_refusal_leaves_no_ownership_and_force_removal_works(
         counter.close()
 
 
+@pytest.mark.linux_only
 @pytest.mark.serial
 def test_force_removal_discards_sealed_unpublished_capture_when_publication_is_deferred(
     silo: Silo, lifecycle_image: str,

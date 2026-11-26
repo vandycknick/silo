@@ -144,6 +144,9 @@ fn early_rejection_system_info_json_is_scoped_and_cold_without_initialization() 
         assert_eq!(live.len(), 5);
         for operation in LiveOperation::ALL {
             let capability = report.live.get(operation);
+            if report.lane == LiveLane::HvfArm64 {
+                assert!(capability.native, "HVF primitive missing: {operation}");
+            }
             if backend == "vz" {
                 assert_eq!(
                     live[operation.as_str()]["availability"]["reason"]["code"],
@@ -253,6 +256,7 @@ fn early_rejection_cold_live_commands_preserve_absent_home_and_checkpoint() {
                         !error.contains(&format!("{operation} unsupported")),
                         "{error}"
                     );
+                    assert!(!error.contains("use silo stop, then a snapshot without memory"));
                 }
                 vm_spec::live::LiveAvailability::Unsupported { reason } => {
                     assert!(

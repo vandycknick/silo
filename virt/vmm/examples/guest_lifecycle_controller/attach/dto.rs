@@ -614,9 +614,14 @@ pub(crate) fn unhex(text: &str) -> eyre::Result<Vec<u8>> {
         .collect()
 }
 
-/// Host CLOCK_MONOTONIC in nanoseconds, comparable with Python
-/// `time.monotonic_ns()` in the orchestrating smoke process.
+/// The host clock behind Python's `time.monotonic_ns()`, in nanoseconds, so
+/// stamps here and in the orchestrating smoke process share one timeline.
+/// CPython reads CLOCK_MONOTONIC on Linux and the Mach uptime clock on macOS.
 pub(crate) fn monotonic_ns() -> eyre::Result<u64> {
+    #[cfg(target_os = "macos")]
+    const CLOCK: nix::libc::clockid_t = nix::libc::CLOCK_UPTIME_RAW;
+    #[cfg(not(target_os = "macos"))]
+    const CLOCK: nix::libc::clockid_t = nix::libc::CLOCK_MONOTONIC;
     // nix exposes clock_gettime only behind its `time` feature, which silo-vmm
     // does not enable; this smoke example must not change dependency features.
     let mut value = nix::libc::timespec {
@@ -624,10 +629,10 @@ pub(crate) fn monotonic_ns() -> eyre::Result<u64> {
         tv_nsec: 0,
     };
     // SAFETY: `value` is a valid, exclusively borrowed timespec for this call.
-    let result = unsafe { nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut value) };
+    let result = unsafe { nix::libc::clock_gettime(CLOCK, &mut value) };
     eyre::ensure!(
         result == 0,
-        "CLOCK_MONOTONIC: {}",
+        "monotonic clock: {}",
         std::io::Error::last_os_error()
     );
     let seconds = u64::try_from(value.tv_sec)?;
@@ -635,7 +640,7 @@ pub(crate) fn monotonic_ns() -> eyre::Result<u64> {
     seconds
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(nanos))
-        .ok_or_else(|| eyre::eyre!("CLOCK_MONOTONIC overflow"))
+        .ok_or_else(|| eyre::eyre!("monotonic clock overflow"))
 }
 
 #[cfg(test)]

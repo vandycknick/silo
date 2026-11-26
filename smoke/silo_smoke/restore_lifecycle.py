@@ -883,7 +883,7 @@ def assert_destroyed(silo: Silo, name: str, machine_hex: str | None) -> None:
 class ChildProcesses:
     holder: dict
     lease: Path
-    processes: dict[str, shutdown.Process] = field(default_factory=dict)
+    processes: dict[str, shutdown.Process | shutdown.DarwinProcessExit] = field(default_factory=dict)
 
     @classmethod
     def observe(cls, silo: Silo, machine_hex: str) -> ChildProcesses:
@@ -893,7 +893,14 @@ class ChildProcesses:
         assert {entry["role"] for entry in value["holders"]} == {"monitor", "krun-worker"}, value
         lease = silo.ws.silo_home / "images/locks/leases" / (value["operationId"] + ".lease")
         silo.ws.record("restore-child-holder", json.dumps(value, sort_keys=True) + "\n")
-        return cls(value, lease, {entry["role"]: shutdown.Process(entry["pid"]) for entry in value["holders"]})
+        children = cls(value, lease)
+        try:
+            for entry in value["holders"]:
+                children.processes[entry["role"]] = shutdown.observe_exit(entry["pid"], entry["startedAt"])
+        except BaseException:
+            children.close()
+            raise
+        return children
 
     def reaped(self) -> None:
         for process in self.processes.values():

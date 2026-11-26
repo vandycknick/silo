@@ -87,9 +87,11 @@ and the worker retains its storage descriptors through actual process exit.
 The manager likewise changes only its child's inheritance flags. Every launch
 starts the monitor by its resolved path, including restore on supported hosts.
 The manager does not retain or compare the executable's identity between
-inspection and launch. Native inspection of the saved state determines
-restore compatibility. macOS still does not admit restore. The Linux worker
-re-execs `/proc/self/exe`, and on other hosts the worker uses `current_exe()`.
+inspection and launch. On krun with HVF on macOS arm64, machine-less inspection
+checks the saved state against destination facts. Only restore construction
+can accept or reject opaque GIC state. Memory snapshots are not portable
+beyond what the destination admits. The Linux worker re-execs
+`/proc/self/exe`; on other hosts the worker uses `current_exe()`.
 
 `KrunConfig` is the single wire type. The monitor validates and serializes it
 and closes fd 3, which marks the end of the config. The worker reads to EOF
@@ -293,6 +295,11 @@ owned output descriptors over its lifecycle socket. Capture staging is private
 (`0700` directories, `0600` files). The plan and write-once `vm.capture.json`
 have one capture mode: writers close without synchronizing files or directories.
 Coherent records require all seven positively observed cut facts.
+
+On macOS arm64, owned output relies on private descriptors and writer closure,
+not a writer-lease probe or sealed clone. The native memory path has no RAM
+cloning or hole punching, so it can spend more time and space than the
+optimized Linux path.
 
 Live fork is a distinct identity policy, not a different snapshot mode.
 It materializes complete owned RAM/state and private disk clones or sparse

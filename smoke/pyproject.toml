@@ -23,6 +23,7 @@ markers = [
   "system: needs SILO_SMOKE_SYSTEM_IMAGE",
   "linux_only: requires Linux",
   "macos_only: requires macOS",
+  "krun_live: live coverage on Linux and macOS arm64 with krun",
   "slow: extended real-VM qualification",
   "serial: must not overlap other VM work (reclaim or fixed-port ownership)",
   "live: requires internet access and explicit selection",

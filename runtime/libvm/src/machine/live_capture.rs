@@ -48,8 +48,8 @@ use crate::machine::live_operations::{
 };
 use crate::machine::{Machine, MachineRef};
 use crate::paths::OwnedDirectory;
-use crate::store::live_store::LiveCommandIntent;
-use crate::store::models::MachineId;
+use crate::store::live_store::{LiveCommandIntent, RetainedLiveCommand};
+use crate::store::models::{MachineConfig, MachineId};
 use crate::store::snapshot_store::{
     CaptureRecord, CaptureReservationRequest, CaptureSourceOutcome, CaptureState, SnapshotInfo,
     SnapshotRef, SnapshotStore,
@@ -463,30 +463,9 @@ impl Machine {
                     "capture reservation is no longer eligible for submission",
                 ));
             }
-            let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
-            let boot = crate::runtime::boot_assets::capture_boot(
-                &reservation.record.storage,
-                &config.spec,
-                &config.guest.agent,
-                runtime.captured_boot_context(&pool, &store, request_id),
-                crate::runtime::boot_assets::CaptureLane::Live,
-            )
-            .await?;
-            snapshots.bind_capture_boot(request_id, boot).await?;
-            let command = LiveCommand::Capture(Box::new(CaptureCommand {
-                envelope: envelope(&fresh, request_id)?,
-                plan: reservation.record.plan.clone(),
-            }));
-            if let LiveCommand::Capture(capture) = &command {
-                capture.validate_plan().map_err(protocol)?;
-            }
-            let intent = LiveCommandIntent {
-                report: fresh.report().clone(),
-                command,
-            };
-            let prepared = store
-                .prepare_live_command(config.id, run, request_id, &intent)
-                .await?;
+            let prepared =
+                prepare_reserved_capture(runtime, &snapshots, &config, &reservation.record, &fresh)
+                    .await?;
             if let Some(result) = prepared.result {
                 return Ok(result);
             }
@@ -558,6 +537,60 @@ impl Machine {
         }
         Ok(())
     }
+}
+
+/// Prepare under the machine lock with the reservation lease held. An error
+/// before the intent exists must not leave the source reserved for a cut.
+async fn prepare_reserved_capture(
+    runtime: &Runtime,
+    snapshots: &SnapshotStore,
+    config: &MachineConfig,
+    record: &CaptureRecord,
+    observation: &MachineLiveObservation,
+) -> Result<RetainedLiveCommand, LibVmError> {
+    let store = &snapshots.store;
+    let capture = record.capture_id;
+    let prepared = async {
+        let pool = crate::storage::pool::StoragePool::open(runtime.local_images_dir())?;
+        let boot = crate::runtime::boot_assets::capture_boot(
+            &record.storage,
+            &config.spec,
+            &config.guest.agent,
+            runtime.captured_boot_context(&pool, store, capture),
+            crate::runtime::boot_assets::CaptureLane::Live,
+        )
+        .await?;
+        snapshots.bind_capture_boot(capture, boot).await?;
+        let command = CaptureCommand {
+            envelope: envelope(observation, capture)?,
+            plan: record.plan.clone(),
+        };
+        let intent = LiveCommandIntent {
+            report: observation.report().clone(),
+            command: LiveCommand::Capture(Box::new(command)),
+        };
+        store
+            .prepare_live_command(config.id, record.run_id, capture, &intent)
+            .await
+    }
+    .await;
+    if prepared.is_err() && !record.dispatch_attempted {
+        let cleanup = async {
+            if store
+                .live_command_record(config.id, record.run_id, capture)
+                .await?
+                .is_none()
+            {
+                snapshots.abandon_capture(capture).await?;
+            }
+            Ok::<(), LibVmError>(())
+        }
+        .await;
+        if let Err(error) = cleanup {
+            tracing::warn!(%capture, %error, "failed to release unsubmitted capture");
+        }
+    }
+    prepared
 }
 
 fn conflict(observation: &MachineLiveObservation) -> Result<LiveCommandResult, LibVmError> {
@@ -2097,6 +2130,51 @@ mod tests {
         options.validate().unwrap();
         options.name = None;
         options.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_boot_capture_releases_the_source_for_another_capture() {
+        let fixture = crate::store::capture::tests::fixture().await;
+        let runtime = crate::store::capture::tests::capture_runtime(&fixture.snapshots).await;
+        let mut record = fixture.reservation.record.clone();
+        let crate::MachineRoot::OpaqueRaw { layout, .. } = &mut record.storage.root else {
+            panic!("expected a raw capture root");
+        };
+        *layout = crate::RawLayout::Partitioned {
+            table: crate::PartitionTable::Mbr,
+        };
+        let crate::BootProfile::LinuxDirect { root_selector, .. } = &mut record.storage.boot else {
+            panic!("expected a Linux capture profile");
+        };
+        *root_selector = crate::RootSelector::MbrPartition { number: 2 };
+        let observation = crate::store::fork::tests::observation(record.machine_id, record.run_id);
+        let check_available = || async {
+            crate::store::capture::ensure_capture_available(
+                &mut fixture.snapshots.store.pool.acquire().await.unwrap(),
+                record.machine_id,
+                record.run_id,
+                uuid::Uuid::nil(),
+            )
+            .await
+        };
+        assert!(matches!(
+            check_available().await,
+            Err(LibVmError::MachineCaptureBusy { .. })
+        ));
+        let refused = crate::machine::live_capture::prepare_reserved_capture(
+            &runtime,
+            &fixture.snapshots,
+            &fixture.config,
+            &record,
+            &observation,
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(LibVmError::InvalidStorageRecord { message, .. })
+                if message.contains("no admitted live capture lane")
+        ));
+        check_available().await.unwrap();
     }
 
     #[test]

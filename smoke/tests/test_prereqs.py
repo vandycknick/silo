@@ -6,12 +6,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 
 import pytest
 
-from silo_smoke import areas, prereqs, toolchain
+from silo_smoke import areas, filesystem, prereqs, toolchain
 from silo_smoke.config import REPO
 from silo_smoke.errors import SmokeEnvironmentError
 
@@ -186,3 +187,24 @@ def test_scratch_refuses_tmpfs_and_defaults_to_durable_storage(monkeypatch: pyte
         prereqs.workspace_parent()
     monkeypatch.delenv("TMPDIR")
     assert prereqs.workspace_parent().is_relative_to(Path.home())
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(shutil.which("zig") is None, reason="requires zig for the Linux arm64 guest compiler")
+def test_static_cc_autodetects_linux_arm64_cross_compiler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CC", "/usr/bin/cc")
+    toolchain.static_cc.cache_clear()
+    try:
+        compiler = toolchain.static_cc()
+        assert compiler == ("zig", "cc", "-target", "aarch64-linux-musl")
+        assert toolchain.links_static(list(compiler), linux_arm64=True)
+    finally:
+        toolchain.static_cc.cache_clear()
+
+
+@pytest.mark.macos_only
+def test_disk_clone_probe_reports_clonefile_and_leaves_no_files(tmp_path: Path) -> None:
+    probe = filesystem.disk_clone_probe(tmp_path)
+    assert probe["method"] == "clonefile" and probe["directory"] == str(tmp_path)
+    assert probe["reflink"] is (probe["errno"] is None)
+    assert list(tmp_path.iterdir()) == []

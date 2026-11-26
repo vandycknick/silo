@@ -25,6 +25,7 @@ import secrets
 import selectors
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -32,6 +33,7 @@ import uuid
 from . import guest_lifecycle, overlay, prereqs
 from .cli import Silo
 from .config import REPO
+from .filesystem import copy_sparse
 from .guest_activation_network import NetworkIdentity
 from .guest_restored_session import (AGENT_PORT, FORWARD_PORT, SSH_PORT, CohortArgs, NativeInputs,
                                      SessionRole, load_native, silo_session_type)
@@ -106,6 +108,14 @@ class RestoredInputs:
     def resolve(cls, silo: Silo) -> RestoredInputs:
         native_root = prereqs.native_root()
         entry = prereqs.example("native-live-api", silo.ws.config.bin_dir, "SILO_SMOKE_NATIVE_LIVE_API")
+        if sys.platform == "darwin":
+            # Sign a workspace copy, not the shared Cargo output or an owner override.
+            private_entry = silo.ws.root / entry.name
+            shutil.copy2(entry, private_entry)
+            subprocess.run(["/usr/bin/codesign", "-f", "-s", "-", "--entitlements",
+                            str(REPO / "virt/vmm/silo-vmm.entitlements"), str(private_entry)],
+                           check=True, capture_output=True, timeout=30)
+            entry = private_entry
         kernel_config = prereqs.kernel_config(silo.ws.config.runtime_dir)
         lines = set(kernel_config.read_text().splitlines())
         require({"CONFIG_VMGENID=y", "CONFIG_VIRTIO_SILO_VMGENID=y"} <= lines,
@@ -500,8 +510,10 @@ class Cohort:
                 and value["native_commands_reconciled"] and not value["activation_released"]
                 and not value["activation_failed"], "actual parked/fenced/private/tracked native restore required")
         facts = value["restore_installation"]
+        # KVM installation dirties guest RAM; HVF installation is observed to dirty none.
         require(facts is not None and facts["tracking_before_install"] and facts["complete"]
-                and facts["dirty_pages"] > 0, "native install effects must follow tracking and enter dirty coverage")
+                and (facts["dirty_pages"] > 0 or sys.platform == "darwin"),
+                "native install effects must follow tracking and enter dirty coverage")
         info = (cut / "memory.ram").stat()
         require(value["file_backings"] and all(pair == [info.st_dev, info.st_ino] for pair in value["file_backings"]),
                 "every child region must use the exact inherited immutable inode")
@@ -590,11 +602,13 @@ class Cohort:
         generation = self.generation(source, "source-generation")
         reseeds = int(generation["fields"]["reseed_count"])
         record["source_generation"] = {"guest": generation, "native": source.native()}
-        profile = source.directory / "profile"
-        record["profile"] = self.attach(source, {"kind": "profile", "directory": str(profile),
-                                                 "kernel_config": str(self.inputs.kernel_config)},
-                                        "profile")["output"]
-        source.command(f"profile {profile}")
+        if sys.platform == "linux":
+            # The native clock profile is KVM evidence (TSC, PIT, lapic deadline).
+            profile = source.directory / "profile"
+            record["profile"] = self.attach(source, {"kind": "profile", "directory": str(profile),
+                                                     "kernel_config": str(self.inputs.kernel_config)},
+                                            "profile")["output"]
+            source.command(f"profile {profile}")
         reference = {"machine_id": identity["machine_id"], "run_id": identity["run_id"],
                      "operation_id": str(uuid.uuid4()), "freeze_epoch": 1}
         freeze = {"kind": "freeze", "request": {"expected": identity, "freeze_ref": reference, "deadline_ms": 5000},
@@ -659,8 +673,7 @@ class Cohort:
         disks = []
         for index in range(2):
             path = self.evidence / f"{label}-disk{index}.raw"
-            subprocess.run(["cp", "--reflink=auto", "--sparse=always", str(cut.directory / f"disk{index}.raw"), str(path)],
-                           check=True, timeout=60, capture_output=True)
+            copy_sparse(cut.directory / f"disk{index}.raw", path, timeout=60)
             path.chmod(0o600)
             disks.append(path)
         role = SessionRole(label, str(uuid.uuid4()), str(uuid.uuid4()), network)

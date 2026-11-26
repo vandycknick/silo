@@ -2,15 +2,14 @@
 
 Date: 2026-10-25
 
-Updated: 2026-11-16
+Updated: 2026-11-26
 
 ## Status
 
 Accepted
 
-This ADR specifies the target architecture, not functionality already
-delivered. The implementation stages and conformance gates below control when
-each capability becomes available. It depends on
+The implementation stages and conformance gates below describe delivery
+and qualification of each capability. This ADR depends on
 [ADR 0014](0014-layered-oci-image-storage.md) for storage identity,
 publication and retention and extends
 [ADR 0018](0018-silo-vmm-contract.md) with the live-command and restore
@@ -98,6 +97,12 @@ the same run.
 Every ended run invalidates its baseline; clean-stop sealing and deterministic
 upper templates remain planned stage 2. Stream-map v1 now replaces flat-map
 metadata; remaining runtime costs still require measured scaling qualification.
+
+The 2026-11-26 revision delivers pause, capture, restore, live fork and
+incremental capture on krun with HVF on macOS arm64. Hibernate and wake use
+the same native capabilities under [ADR 0023](0023-machine-hibernate-and-wake.md).
+macOS 26 remains the floor; macOS 27 is unqualified. VZ remains excluded from
+snapshots, restores, forks and live operations, including hibernation.
 
 ### Snapshot memory terminology (2026-11-18)
 
@@ -323,15 +328,12 @@ libkrun backend**, built from five commitments:
   activation and identity rotation inside the guest. No component gains
   database access or a new long-running process.
 
-The capability is admitted per lane: Linux KVM x86_64, Linux KVM arm64 with
-GICv3, and macOS HVF arm64. Silo supports macOS 26 or newer
-([ADR 0012](0012-cross-platform-runtime-and-sdk-packaging.md)). VZ machines retain
-[ADR 0014](0014-layered-oci-image-storage.md)'s snapshots without memory only; every
-backend reports what it supports before any live operation starts, and an
-unsupported operation is refused up front, never partway (see Backend
-Capabilities And Early Rejection). Snapshots with memory restore on the same
-host class they were captured on; cross-host execution restore is a
-separately admitted profile with its own compatibility contract.
+The native capability report distinguishes Linux KVM x86_64, Linux KVM arm64
+with GICv3, and macOS HVF arm64. On each lane only the native primitives that
+are delivered and pass host and machine admission are available. The VZ
+backend refuses even snapshots without memory
+([ADR 0014](0014-layered-oci-image-storage.md)). Memory snapshots are not
+portable across hosts beyond what destination inspection and restore admit.
 
 ### Core invariants
 
@@ -968,6 +970,13 @@ the implementation does not claim untouched-page skipping for every backing.
 Incremental discarded dirty pages are still classified by reading their bytes,
 not skipped based on discard history. Swapped and huge-page cases have not been
 separately qualified; their inclusion or fallback is not a qualification claim.
+
+On macOS arm64, the native RAM path has neither RAM cloning nor hole punching.
+Incremental capture can limit live guest reads to dirty pages, but it may copy
+baseline RAM and write zeros where a hole cannot be punched. This can take
+longer and produce larger RAM files than the optimized Linux path.
+Private output descriptors, capture ordering and writer closure are the
+Darwin authority boundary; there is no writer-lease probe or sealed RAM clone.
 
 ### Identity and chains
 
@@ -1626,6 +1635,10 @@ machine-profile refusals. Support does not depend on a build allowlist, a
 source tree being clean, or a previous local test result. Positive mock
 scenarios exercise transport, not native execution.
 
+On admitted macOS arm64 krun hosts, `silo system info` reports all five
+operations as `supported` with `native: true`. The machine report can still
+refuse a device or guest profile.
+
 The informational `buildIdentity` is `v1:silo:<target>:<package-version>`, using
 only Silo's Cargo environment. It is useful alongside binary digests in system
 information and smoke evidence, but it does not participate in restore admission.
@@ -1635,11 +1648,10 @@ Capture receipts and snapshot compatibility profiles carry `liveStateSchema`
 and `architecture`. The native capabilities API exports `LIVE_STATE_SCHEMA`
 (`silo.live-state/1`); bump that summary whenever any component's state magic or
 schema changes. Each encoder owns its magic and schema constant, and its decoder
-checks both. Restore compatibility refuses only schema or guest-architecture
-mismatches, with typed expected/found diagnostics, never a different build,
-compiler, checkout, feature fingerprint or source revision. Existing checks of
-captured hashes, topology, device inventories and host resource readiness remain
-integrity and execution-safety checks, not producer identity policy.
+checks both. Restore refuses schema or guest-architecture mismatches with
+typed expected/found diagnostics. It also checks captured hashes, topology,
+device inventories and destination host compatibility, not the producer's
+build, compiler, checkout, feature fingerprint or source revision.
 
 Machine-less native host queries supply operation and host facts without creating
 a VM. Unknown VM/GIC admission remains unknown, and neither API access nor optional
@@ -1684,12 +1696,14 @@ operation, actual backend, lane, reason and typed device/profile subject where
 applicable. Discovery/protocol/observation failures are separate typed errors,
 not extra semantic unsupported reasons. Persisted machine/runtime state and
 logical database contents are unchanged during the operation interval.
-The CLI prints one line with the reason and the
-supported alternative; for a VZ machine that is `silo stop` followed by
-`silo snapshot create` without `--memory` ([ADR 0014](0014-layered-oci-image-storage.md)). `silod`
-returns the same error as a precondition failure with the reason code, and
-its status API carries the host vector so a remote client can decide before
-it sends the request. `silo system info` and `silo info` print the vector.
+The CLI prints one line with the reason. On VZ it directs the user to krun;
+on HVF it reports the typed refusal without a stopped-snapshot hint.
+`silod` returns unsupported capability errors as precondition failures with
+the reason code and exposes the host vector for remote clients.
+`silo system info` and `silo info` print the vector.
+
+An error in boot preparation before a live capture intent exists abandons
+the reservation so it does not block the next capture or fork.
 
 Runtime admission is separate from this explicit read-only capability
 observation. Every runtime open, including `RuntimeOpenMode::Observation`,
@@ -1858,11 +1872,11 @@ destination matches:
 | Guest assets | Exact running kernel, initramfs provenance, agent binary and configuration schema, VM generation driver. A restore cannot upgrade any of them. |
 | Storage | Exact sealed disk identities, lower closure, root profile and geometry; required external resources with destination bindings. |
 
-The initial target is the same host class: same hypervisor and CPU contract,
-with the compatible state formats above, in a fresh process after the source
-and its directory may be gone. A different Silo or libkrun build alone is not a
-refusal. Same-architecture restore on another host remains a separate execution
-portability profile.
+The target is the same host class: the same hypervisor and compatible CPU
+contract and state formats, in a fresh process after the source and its
+directory may be gone. A different Silo or libkrun build alone is not a
+refusal. Matching the guest architecture alone does not make a memory
+snapshot portable to another host.
 Execution relocation through [ADR 0014](0014-layered-oci-image-storage.md)'s handoff protocol is a separately
 admitted mode that preserves the captured boot bundle and keeps the source
 fenced until ownership commits; it never uses fork auto-resume.
@@ -1876,11 +1890,14 @@ operation that discards RAM and boots a new machine from private copies of the
 sealed disks with stop outcome `unknown`; the disks may need journal recovery.
 It is never offered as a fallback for a failed restore.
 
-The HVF lane needs the Hypervisor.framework GIC state APIs, which macOS 15
-introduced. Silo's macOS floor is 26, so every supported host has them. A
-host below the floor reports `host-os-below-floor` and retains ordinary boot
-and snapshots without memory. A missing API resolves to a typed refusal,
-never fabricated support.
+HVF requires the Hypervisor.framework GIC state APIs and the unchanged Silo
+macOS 26 floor. A host below the floor reports `host-os-below-floor`; missing
+required APIs also refuse. Machine-less inspection checks the saved state
+against destination facts such as CPU capacity and model, address ranges,
+page granule, counter frequency, Mach timebase, GIC geometry and MMIO
+placement. It does not install or validate the opaque GIC state. Acceptance
+or rejection of that state happens in real restore construction. macOS 27
+is unqualified.
 
 ## Security And Trust
 
@@ -2220,8 +2237,9 @@ HVF arm64 on macOS 26 or later); their results do not grant runtime support.
   preflight with the pin named; disk-only recovery remains available as the
   distinct operation; no implicit reboot.
 - **Early rejection.** On a VZ-backed machine, a macOS host below the floor, a lane
-  without a gate record, and a libkrun machine with a rejected device: `silo
-  pause`, `silo snapshot create --memory`, `silo fork` and execution restore fail with
+  without the requested native primitive, and a libkrun machine with a
+  rejected device: `silo pause`, `silo snapshot create --memory`,
+  `silo fork --live` and execution restore fail with
   `LiveOperationUnsupported` and the typed reason before any lock, lease,
   budget reservation, child allocation or monitor command; the machine state,
   run ID and database are byte-identical before and after; `silo system

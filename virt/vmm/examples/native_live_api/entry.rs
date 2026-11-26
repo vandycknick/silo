@@ -6,6 +6,7 @@ use std::num::{NonZeroU32, NonZeroU8};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crate::krun::engine::{self, ConsoleFds, ConsolePort, Control, Resources};
@@ -202,18 +203,29 @@ fn input_authority(
 #[path = "mutate.rs"]
 mod mutate;
 
-pub(crate) fn main() -> eyre::Result<()> {
+pub(crate) fn main() -> eyre::Result<ExitCode> {
     let mut arguments = std::env::args_os().skip(1);
     match arguments.next().as_deref() {
         #[cfg(target_os = "linux")]
         Some(command) if command == std::ffi::OsStr::new("mutate-execution") => {
-            return crate::entry::mutate::run(arguments.collect());
+            return crate::entry::mutate::run(arguments.collect()).map(|()| ExitCode::SUCCESS);
         }
         Some(command) if command == std::ffi::OsStr::new("inspect-execution") => {
-            return crate::entry::mutate::inspect(arguments.collect());
+            return crate::entry::mutate::inspect(arguments.collect()).map(|()| ExitCode::SUCCESS);
         }
         Some(command) if command == std::ffi::OsStr::new("inspect-devices") => {
-            return crate::entry::mutate::inspect_devices(arguments.collect());
+            return crate::entry::mutate::inspect_devices(arguments.collect())
+                .map(|()| ExitCode::SUCCESS);
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Some(command) if command == std::ffi::OsStr::new("inspect-compatibility") => {
+            eyre::bail!(
+                "offline compatibility inspection requires HVF; the KVM probe creates a VM"
+            );
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        Some(command) if command == std::ffi::OsStr::new("inspect-compatibility") => {
+            return inspect_compatibility(arguments.collect());
         }
         _ => {}
     }
@@ -611,6 +623,158 @@ fn disk_id(index: usize, silo_fixture: bool) -> String {
         "silo-root".to_string()
     } else {
         format!("disk{index}")
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn inspect_compatibility(arguments: Vec<std::ffi::OsString>) -> eyre::Result<ExitCode> {
+    use libkrun::live::inspection::{ExpectedDevice, ExpectedDeviceKind as Kind, InspectionInputs};
+
+    let usage =
+        "usage: native-live-api inspect-compatibility CUT_DIRECTORY [SILO_FIXTURE [DISK_COUNT]]";
+    let [directory, options @ ..] = arguments.as_slice() else {
+        eyre::bail!("{usage}");
+    };
+    ensure!(options.len() <= 2, "{usage}");
+    let silo_fixture = options
+        .first()
+        .map(|value| -> eyre::Result<bool> {
+            Ok(value
+                .to_str()
+                .ok_or_else(|| eyre::eyre!("SILO_FIXTURE must be true or false"))?
+                .parse()?)
+        })
+        .transpose()?;
+    let disk_count = options
+        .get(1)
+        .map(|value| -> eyre::Result<usize> {
+            Ok(value
+                .to_str()
+                .ok_or_else(|| eyre::eyre!("DISK_COUNT must be an integer"))?
+                .parse::<u8>()?
+                .into())
+        })
+        .transpose()?;
+    let directory = Path::new(directory);
+    let manifest = load(&directory.join("api-capture.json"))?;
+    let binding = parse_binding(&manifest["binding"])?;
+    let ram_image = input_authority(binding.clone(), directory, &manifest)?;
+    let execution = File::open(directory.join("execution.state"))?;
+    let devices = File::open(directory.join("devices.state"))?;
+    let layout = File::open(directory.join("memory-layout.json"))?;
+    let identified = matches!(ram_image, RamInputAuthority::IdentifiedSnapshot(_));
+    let state_object = |role: &str, file: &File| -> eyre::Result<StateObjectAuthority> {
+        if identified {
+            Ok(StateObjectAuthority::Identified(object_identity(
+                file,
+                &manifest[role],
+            )?))
+        } else {
+            owned_object(file, &manifest[role])
+        }
+    };
+    let layout_object = if identified {
+        StateObjectAuthority::Identified(StateObjectIdentity {
+            length: layout.metadata()?.len(),
+            sha256: binding.ram_layout,
+        })
+    } else {
+        owned_object(&layout, &manifest["layout"])?
+    };
+    let expected = RestoreIdentity {
+        binding,
+        ram_image,
+        execution_object: state_object("execution", &execution)?,
+        devices_object: state_object("devices", &devices)?,
+    };
+
+    let fixture_ids = manifest["attachments"].as_array().map(|attachments| {
+        attachments
+            .iter()
+            .filter_map(|attachment| attachment["configured_id"].as_str())
+    });
+    let silo_fixture = silo_fixture.unwrap_or_else(|| {
+        fixture_ids
+            .clone()
+            .is_some_and(|mut ids| ids.any(|id| id == "silo-root"))
+    });
+    let disk_count = disk_count.unwrap_or_else(|| {
+        fixture_ids.map_or(2, |ids| {
+            ids.filter(|id| {
+                *id == "silo-root"
+                    || id
+                        .strip_prefix("disk")
+                        .is_some_and(|index| index.parse::<u8>().is_ok())
+            })
+            .count()
+        })
+    });
+    let device = |id: &str, kind| ExpectedDevice {
+        configured_id: id.into(),
+        kind,
+    };
+    let mut expected_devices = vec![
+        device(
+            "hvc0",
+            Kind::Console {
+                ports: vec![
+                    ("".into(), true, true, true),
+                    ("probe1".into(), true, false, false),
+                    ("probe2".into(), false, true, false),
+                    ("probe3".into(), false, false, false),
+                ],
+            },
+        ),
+        device("vsock", Kind::Vsock { cid: 3 }),
+        device("net0", Kind::Network),
+        device("rng", Kind::Rng),
+        device("balloon", Kind::Balloon),
+        device("silo-vmgenid", Kind::Generation),
+    ];
+    for index in 0..disk_count {
+        expected_devices.push(device(
+            &disk_id(index, silo_fixture),
+            Kind::Block {
+                format: libkrun::DiskFormat::Raw,
+                byte_length: std::fs::metadata(directory.join(format!("disk{index}.raw")))?.len(),
+                read_only: false,
+            },
+        ));
+    }
+
+    match libkrun::live::inspection::inspect_compatibility(
+        InspectionInputs {
+            execution: &execution,
+            devices: &devices,
+            layout: &layout,
+            expected: &expected,
+            layout_object: &layout_object,
+        },
+        &expected_devices,
+        deadline(),
+    ) {
+        Ok(admitted) => {
+            reply(
+                "ADMITTED",
+                &json!({
+                    "cpu_count": admitted.cpu_count(),
+                    "device_count": admitted.devices().len(),
+                    "ram_bytes": admitted.layout().packed_len(),
+                    "granule": admitted.layout().granule(),
+                }),
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            let refusal = crate::krun::restore::inspection_refusal(error, &expected.binding);
+            reply(
+                "REFUSED",
+                &json!({
+                    "pin": refusal.pin, "expected": refusal.expected, "actual": refusal.actual,
+                }),
+            )?;
+            Ok(ExitCode::FAILURE)
+        }
     }
 }
 

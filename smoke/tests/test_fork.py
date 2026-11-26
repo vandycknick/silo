@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 from uuid import UUID
 
 import pytest
@@ -20,7 +21,7 @@ from silo_smoke import capture, fork, pause, procs, restore, shutdown, stopped
 from silo_smoke import restore_lifecycle as lifecycle
 from silo_smoke.cli import ROOT_PROFILES, RootProfile, Silo
 
-pytestmark = [pytest.mark.linux_only, pytest.mark.slow, pytest.mark.serial]
+pytestmark = [pytest.mark.slow, pytest.mark.serial]
 
 SOURCE = "fork-source"
 NAMES = ["fork-a", "fork-b", "fork-c", "fork-d"]
@@ -154,12 +155,15 @@ def source_running(silo: Silo, prepared: Prepared) -> None:
 
 # -- acceptance -------------------------------------------------------------------
 
+@pytest.mark.krun_live
 def test_live_restore_and_fork_without_public_vsock(
-    silo: Silo, restore_image: str,
+    silo: Silo, request: pytest.FixtureRequest,
 ) -> None:
     source = "no-vsock-source"
     restored = "no-vsock-restored"
     names = ["no-vsock-fork-a", "no-vsock-fork-b"]
+    native_witness = sys.platform != "darwin"
+    restore_image = request.getfixturevalue("restore_image" if native_witness else "basic_image")
     silo.create(source, restore_image, "--disk-size", "256mib", "--network", "none",
                 "--cpus", "2", "--memory", "512mib")
     silo.start(source)
@@ -176,11 +180,21 @@ def test_live_restore_and_fork_without_public_vsock(
         assert not public_socket.exists(), public_socket
 
     running_without_public_vsock(source, source_info)
-    initial = restore.start_witness(silo, source)
+    initial = restore.start_witness(silo, source) if native_witness else None
+    marker = "/dev/shm/no-vsock-witness"
+    if initial is None:
+        silo.exec(source, "sh", "-ec", f"printf live >{marker}", user="root")
+
+    def continued_execution(name: str) -> None:
+        if initial is not None:
+            restore.advances(silo, name, initial)
+        else:
+            assert silo.exec(name, "cat", marker).stdout == "live"
+
     saved = restore.checkpoint(silo, source, alias="no-vsock-checkpoint")
     child = restore.restore_child(silo, saved, restored)
     running_without_public_vsock(restored, child)
-    restore.advances(silo, restored, initial)
+    continued_execution(restored)
 
     silo.run("resume", source)
     running_without_public_vsock(source, silo.wait_ready(source))
@@ -191,10 +205,11 @@ def test_live_restore_and_fork_without_public_vsock(
     assert fork.outcomes(result) == ["running", "running"], result
     for name in names:
         running_without_public_vsock(name, silo.wait_ready(name))
-        restore.advances(silo, name, initial)
+        continued_execution(name)
     running_without_public_vsock(source, silo.wait_ready(source))
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
     silo: Silo, restore_image: str, profile: RootProfile,
@@ -301,6 +316,7 @@ def test_fork_four_children_run_from_one_matched_cut_with_unique_identities(
     gone_after_prune(silo, call.operation)
 
 
+@pytest.mark.linux_only
 def test_fork_child_failure_after_seal_names_that_child_and_keeps_siblings(
     silo: Silo, restore_image: str,
 ) -> None:
@@ -348,6 +364,7 @@ def failed_child(silo: Silo, child: dict) -> dict | None:
     return state
 
 
+@pytest.mark.linux_only
 def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
     silo: Silo, restore_image: str,
 ) -> None:
@@ -387,6 +404,7 @@ def test_fork_children_share_one_clean_ram_inode_by_pss_not_rss(
     gone_after_prune(silo, *operations)
 
 
+@pytest.mark.linux_only
 def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
     silo: Silo, restore_image: str,
 ) -> None:
@@ -426,15 +444,21 @@ def test_fork_children_outlive_source_deletion_and_gc_then_recapture(
     stopped.stop(silo, "fork-recaptured-child", require_clean=False)
 
 
+@pytest.mark.krun_live
 @pytest.mark.parametrize("profile", ROOT_PROFILES)
 @pytest.mark.parametrize("order", ["child-first", "source-first"])
 def test_force_remove_fork_lineage_preserves_survivors_and_published_snapshot(
-    silo: Silo, restore_image: str, profile: RootProfile, order: str,
+    silo: Silo, request: pytest.FixtureRequest, profile: RootProfile, order: str,
 ) -> None:
     source, child, grandchild, restored = "force-source", "force-child", "force-grandchild", "force-restored"
+    native_witness = sys.platform != "darwin"
+    restore_image = request.getfixturevalue("restore_image" if native_witness else "basic_image")
     restore.create_source(silo, restore_image, profile=profile, name=source)
     mark(silo, source, "source-cut")
-    initial = restore.start_witness(silo, source)
+    initial = restore.start_witness(silo, source) if native_witness else None
+    memory = "/dev/shm/force-lineage-witness"
+    if initial is None:
+        silo.exec(source, "sh", "-ec", f"printf inherited >{memory}", user="root")
     first = fork.run(silo, source, [child], expect=0)
     assert first.result is not None and fork.outcomes(first.result) == ["running"]
     silo.wait_ready(child)
@@ -456,11 +480,17 @@ def test_force_remove_fork_lineage_preserves_survivors_and_published_snapshot(
         assert {entry["name"] for entry in silo.ls()} == set(expected)
         for survivor, value in expected.items():
             assert marker(silo, survivor) == value
-            restore.advances(silo, survivor, restore.witness(silo, survivor))
+            if initial is not None:
+                restore.advances(silo, survivor, restore.witness(silo, survivor))
+            else:
+                assert silo.exec(survivor, "cat", memory).stdout == "inherited"
     # A snapshot's independent pool roots survive every originating machine.
     restore.restore_child(silo, saved, "force-after-lineage")
     assert marker(silo, "force-after-lineage") == "child-cut"
-    restore.advances(silo, "force-after-lineage", initial)
+    if initial is not None:
+        restore.advances(silo, "force-after-lineage", initial)
+    else:
+        assert silo.exec("force-after-lineage", "cat", memory).stdout == "inherited"
     silo.run("rm", "--force", "force-after-lineage", timeout=180)
     silo.run("snapshot", "rm", "force-lineage-snapshot")
     gone_after_prune(silo, first.operation, second.operation)
@@ -501,10 +531,11 @@ def ledger(silo: Silo) -> dict[str, bytes]:
             and path.name != f"{prefix}home.json" and path.is_file()}
 
 
-def refused_before_freeze(silo: Silo, prepared: Prepared, names: list[str], *flags: str,
+def refused_before_freeze(silo: Silo, prepared: Prepared | dict, names: list[str], *flags: str,
                           nofile: int | None = None) -> fork.Call:
     """Whole-batch refusal: no freeze, capture, child, cut or ledger charge."""
-    captures, staged = capture_dirs(silo, prepared.info["id"]), staged_lines(silo, prepared.info["id"])
+    info = prepared.info if isinstance(prepared, Prepared) else prepared
+    captures, staged = capture_dirs(silo, info["id"]), staged_lines(silo, info["id"])
     charges = ledger(silo)
     call = fork.run(silo, SOURCE, names, *flags, nofile=nofile, timeout=120)
     assert call.returncode != 0, "batch over budget was admitted"
@@ -515,13 +546,18 @@ def refused_before_freeze(silo: Silo, prepared: Prepared, names: list[str], *fla
         for child in call.result["children"]:
             if child["outcome"]["kind"] == "failed":
                 assert child["outcome"]["phase"] == "capture", child
-    assert capture_dirs(silo, prepared.info["id"]) == captures, "refusal staged a capture"
-    assert staged_lines(silo, prepared.info["id"]) == staged, "refused batch froze the source"
+    assert capture_dirs(silo, info["id"]) == captures, "refusal staged a capture"
+    assert staged_lines(silo, info["id"]) == staged, "refused batch froze the source"
     assert not fork.cut_directory(silo, call.operation).parent.exists()
     assert ledger(silo) == charges, "refused batch published a cross-home charge"
     listed = {entry["name"] for entry in silo.ls()}
     assert not listed & set(names), listed
-    source_running(silo, prepared)
+    if isinstance(prepared, Prepared):
+        source_running(silo, prepared)
+    else:
+        current = silo.info(SOURCE)
+        assert current["state"] == "running" and current["run_id"] == info["run_id"], current
+        silo.exec(SOURCE, "true")
     silo.ws.record("fork-refusal", json.dumps({
         "flags": list(flags), "children": len(names), "nofile": nofile, "exit": call.returncode,
         "stderr": call.stderr, "result": call.result}, sort_keys=True) + "\n")
@@ -537,10 +573,17 @@ def refusal_diagnostic(call: fork.Call) -> str:
     return call.stderr
 
 
+@pytest.mark.krun_live
 def test_fork_refuses_count_and_descriptor_budgets_before_freeze(
-    silo: Silo, restore_image: str,
+    silo: Silo, request: pytest.FixtureRequest,
 ) -> None:
-    prepared = prepare(silo, restore_image, profile="layered", memory="1gib")
+    if sys.platform == "darwin":
+        create(silo, request.getfixturevalue("basic_image"), profile="layered", memory="1gib")
+        silo.start(SOURCE)
+        prepared = silo.wait_ready(SOURCE)
+        require_fork(prepared)
+    else:
+        prepared = prepare(silo, request.getfixturevalue("restore_image"), profile="layered", memory="1gib")
     # Count: 17 children exceed the default maximum of 16 without an explicit flag.
     refused_before_freeze(silo, prepared, [f"count-{index}" for index in range(17)])
     # Descriptors: the manager's own RLIMIT_NOFILE cannot hold sixteen handoffs.
@@ -552,6 +595,7 @@ def test_fork_refuses_count_and_descriptor_budgets_before_freeze(
 
 # -- cancellation and manager death ------------------------------------------------
 
+@pytest.mark.linux_only
 def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest(
     silo: Silo, restore_image: str,
 ) -> None:
@@ -596,6 +640,7 @@ def test_fork_post_seal_cancel_preserves_submitted_children_and_cancels_the_rest
         traced.close()
 
 
+@pytest.mark.linux_only
 def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
     silo: Silo, restore_image: str,
 ) -> None:
@@ -631,6 +676,7 @@ def test_fork_manager_killed_before_seal_recovers_one_cut_and_abandons_children(
         traced.close()
 
 
+@pytest.mark.linux_only
 def test_fork_manager_killed_during_child_construction_recovers_without_orphans(
     silo: Silo, restore_image: str,
 ) -> None:

@@ -1,11 +1,12 @@
-"""Independent Linux process/inode/lease observables for production shutdown smoke.
+"""Independent process/inode/lease observables for production shutdown smoke.
 
 No fact is synthesized here. JSON is the product under test, checked against
-kernel process/FD state and durable storage contents. All signals use pidfds.
+kernel process/FD state and durable storage contents. Linux signals use pidfds.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import ExitStack, closing, contextmanager
 import ctypes
 import fcntl
 import json
@@ -15,6 +16,7 @@ import select
 import signal
 import stat
 import subprocess
+import sys
 import time
 from uuid import UUID
 
@@ -79,6 +81,51 @@ class Process:
         os.close(self.fd)
 
 
+class DarwinProcessExit:
+    """Watch one live process generation without signaling a bare PID."""
+
+    def __init__(self, pid: int, started_at: int) -> None:
+        birth = procs.darwin_birth(pid)
+        assert birth is not None and birth[0] == started_at, (pid, started_at, birth)
+        self.pid = pid
+        self.queue = select.kqueue()
+        self._terminal = False
+        try:
+            event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
+                                  fflags=select.KQ_NOTE_EXIT)
+            self.queue.control([event], 0)
+            assert procs.darwin_birth(pid) == birth, f"process {pid} changed during exit watch setup"
+        except BaseException:
+            self.queue.close()
+            raise
+
+    def terminal(self) -> bool:
+        if not self._terminal:
+            self._terminal = bool(self.queue.control(None, 1, 0))
+        return self._terminal
+
+    def wait(self, timeout: float = 30) -> None:
+        until(self.terminal, timeout=timeout, description=f"process {self.pid} not terminal")
+
+    def close(self) -> None:
+        self.queue.close()
+
+
+def observe_exit(pid: int, started_at: int) -> Process | DarwinProcessExit:
+    if sys.platform == "darwin":
+        return DarwinProcessExit(pid, started_at)
+    return Process(pid)
+
+
+@contextmanager
+def observe_holders(silo: Silo, name: str) -> Iterator[tuple[dict, Path, list[Process | DarwinProcessExit]]]:
+    value, lease = holder(silo, name)
+    with ExitStack() as cleanup:
+        processes = [cleanup.enter_context(closing(observe_exit(entry["pid"], entry["startedAt"])))
+                     for entry in value["holders"]]
+        yield value, lease, processes
+
+
 @contextmanager
 def subreaper():
     # The monitor daemon double-forks. Adopt only this test's descendants so
@@ -129,11 +176,16 @@ def holder(silo: Silo, name: str) -> tuple[dict, Path]:
     assert UUID(value["operationId"]).int != 0
     assert {entry["role"] for entry in value["holders"]} == {"monitor", "krun-worker"}
     assert len(value["holders"]) == 2 and all(entry["startedAt"] > 0 for entry in value["holders"])
-    boot_seconds = int(next(line.split()[1] for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime ")))
-    for entry in value["holders"]:
-        fields = Path(f"/proc/{entry['pid']}/stat").read_text().rsplit(") ", 1)[1].split()
-        assert fields[0] not in ("Z", "X")
-        assert entry["startedAt"] == boot_seconds + int(fields[19]) // os.sysconf("SC_CLK_TCK")
+    if sys.platform == "darwin":
+        for entry in value["holders"]:
+            birth = procs.darwin_birth(entry["pid"])
+            assert birth is not None and birth[0] == entry["startedAt"], entry
+    else:
+        boot_seconds = int(next(line.split()[1] for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime ")))
+        for entry in value["holders"]:
+            fields = Path(f"/proc/{entry['pid']}/stat").read_text().rsplit(") ", 1)[1].split()
+            assert fields[0] not in ("Z", "X")
+            assert entry["startedAt"] == boot_seconds + int(fields[19]) // os.sysconf("SC_CLK_TCK")
     lease = silo.ws.silo_home / "images/locks/leases" / (value["operationId"] + ".lease")
     metadata = lease.stat()
     assert stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
