@@ -501,10 +501,18 @@ impl VirtBackend for KrunBackend {
 
         let deadline = Instant::now() + VSOCK_CONNECT_TIMEOUT;
         let (stream, session_guard, in_flight) = mux.connect(port, deadline).await?;
-        let mut stream = UnixStream::from_std(stream)?;
-        let source_port = read_connect_response(&mut stream, deadline).await?;
+        let mut unanswered = mux::HeldUntil::new(
+            (UnixStream::from_std(stream)?, session_guard, in_flight),
+            deadline,
+        );
+        let source_port = match unanswered.get_mut() {
+            Some((stream, _, _)) => read_connect_response(stream, deadline).await?,
+            None => return Err(lost_descriptors()),
+        };
         // The worker answered, so it holds the descriptor now.
-        drop(in_flight);
+        let Some((stream, session_guard, _in_flight)) = unanswered.settle() else {
+            return Err(lost_descriptors());
+        };
         Ok(VsockStream::from_krun_stream(
             stream,
             source_port,
@@ -788,6 +796,10 @@ fn krun_mount(mount: &SharedDirectory) -> KrunMount {
         path: mount.host_path.clone(),
         read_only: mount.read_only,
     }
+}
+
+fn lost_descriptors() -> VirtError {
+    VirtError::Backend("krun vsock connection lost its descriptors".to_string())
 }
 
 async fn read_connect_response(stream: &mut UnixStream, deadline: Instant) -> io::Result<u32> {

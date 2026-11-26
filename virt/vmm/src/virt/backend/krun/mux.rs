@@ -109,6 +109,54 @@ pub(super) struct InFlightDescriptor(
     #[expect(dead_code, reason = "held only to keep the descriptor open")] OwnedFd,
 );
 
+/// Our side of a connection the worker has been handed but has not answered.
+///
+/// Giving up early (a caller's own timeout, a dropped request) must not close
+/// it at once: the worker may not have taken the descriptor from the control
+/// socket yet, and it treats a descriptor whose peer is already gone as a
+/// broken control channel, which ends every vsock connection of the machine.
+/// Dropped unsettled, the value therefore stays alive until the deadline.
+pub(super) struct HeldUntil<T: Send + 'static> {
+    value: Option<T>,
+    deadline: Instant,
+}
+
+impl<T: Send + 'static> HeldUntil<T> {
+    pub(super) fn new(value: T, deadline: Instant) -> Self {
+        Self {
+            value: Some(value),
+            deadline,
+        }
+    }
+
+    pub(super) fn get_mut(&mut self) -> Option<&mut T> {
+        self.value.as_mut()
+    }
+
+    /// The worker has answered (or was never sent anything): hand the value back.
+    pub(super) fn settle(mut self) -> Option<T> {
+        self.value.take()
+    }
+}
+
+impl<T: Send + 'static> Drop for HeldUntil<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        let deadline = self.deadline;
+        if Instant::now() >= deadline {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                drop(value);
+            });
+        }
+    }
+}
+
 impl KrunVsockMux {
     pub(super) fn pair(
         registry: KrunVsockRegistry,
@@ -178,8 +226,8 @@ impl KrunVsockMux {
         .map_err(|_| timed_out("reserving krun vsock queue capacity"))?
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "krun vsock mux stopped"))?;
         let (host, helper) = new_socketpair()?;
-        let in_flight = InFlightDescriptor(helper.try_clone()?);
         suppress_sigpipe(host.as_raw_fd())?;
+        let held = HeldUntil::new((host, InFlightDescriptor(helper.try_clone()?)), deadline);
         let (sent, received) = oneshot::channel();
         let mut cancellation = ConnectCancellation {
             notify: self.cancellation_notify.clone(),
@@ -204,6 +252,9 @@ impl KrunVsockMux {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "krun vsock mux stopped"))?;
         cancellation.armed = false;
         result?;
+        let (host, in_flight) = held
+            .settle()
+            .ok_or_else(|| io::Error::other("krun vsock request lost its descriptors"))?;
         let stream = StdUnixStream::from(host);
         let guard = self.session.track(stream.as_fd())?;
         Ok((stream, guard, in_flight))
@@ -1110,5 +1161,28 @@ mod tests {
         assert!(!old.is_active());
         assert!(replacement.is_active());
         assert!(!std::sync::Arc::ptr_eq(&old, &replacement));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_connection_stays_open_until_its_deadline() {
+        use crate::virt::backend::krun::mux::HeldUntil;
+        let mut byte = [0_u8; 1];
+
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        theirs.set_nonblocking(true).expect("nonblocking");
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        drop(HeldUntil::new(ours, deadline));
+        assert_eq!(
+            theirs.read(&mut byte).expect_err("peer still open").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(theirs.read(&mut byte).expect("peer closed at deadline"), 0);
+
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        theirs.set_nonblocking(true).expect("nonblocking");
+        let held = HeldUntil::new(ours, std::time::Instant::now() + Duration::from_secs(60));
+        drop(held.settle().expect("settled value"));
+        assert_eq!(theirs.read(&mut byte).expect("settled value closes"), 0);
     }
 }
