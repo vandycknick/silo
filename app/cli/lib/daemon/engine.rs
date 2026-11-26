@@ -12,6 +12,7 @@ use crate::daemon::system_config::ResolvedSystemConfig;
 
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const ENGINE_REACHABLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVICE_MANAGER_POLL: Duration = Duration::from_millis(100);
 
 /// Stops Docker in the guest so containers exit cleanly before the VM stops. Best
 /// effort: the VM stop that follows is authoritative.
@@ -25,6 +26,47 @@ pub(crate) async fn stop_engine(machine: &SystemMachine) {
             Duration::from_secs(30),
         )
         .await;
+}
+
+/// The guest reports ready as soon as its agent serves, which can be before
+/// systemd accepts requests; activation issued in that gap fails with "Failed
+/// to connect to system scope bus". Wait until the manager answers.
+pub(crate) async fn wait_service_manager(
+    machine: &SystemMachine,
+    timeout: Duration,
+) -> eyre::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let output = machine
+            .exec_with_input(
+                "/usr/bin/systemctl",
+                &["is-system-running"],
+                "root",
+                Vec::new(),
+                Duration::from_secs(10),
+            )
+            .await?;
+        if service_manager_answered(output.stdout_bytes()) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "guest service manager did not become reachable: {}",
+                guest_error(&String::from_utf8_lossy(output.stderr_bytes()))
+            );
+        }
+        tokio::time::sleep(SERVICE_MANAGER_POLL).await;
+    }
+}
+
+/// `systemctl is-system-running` prints the manager's state once it can reach
+/// it (starting, running, degraded and so on) and nothing, `offline` or
+/// `unknown` while it cannot.
+fn service_manager_answered(stdout: &[u8]) -> bool {
+    !matches!(
+        String::from_utf8_lossy(stdout).trim(),
+        "" | "offline" | "unknown"
+    )
 }
 
 pub(crate) async fn activate(
@@ -216,7 +258,9 @@ pub(crate) fn probe_docker_socket(path: &Path) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::daemon::engine::{activation_request, ensure_docker_socket_parent, guest_error};
+    use crate::daemon::engine::{
+        activation_request, ensure_docker_socket_parent, guest_error, service_manager_answered,
+    };
     use crate::daemon::system_config::{ResolvedShare, ResolvedSystemConfig};
 
     #[test]
@@ -229,6 +273,16 @@ mod tests {
             "silo-system-activate: invalid request; second"
         );
         assert_eq!(guest_error(" \n"), "no error output");
+    }
+
+    #[test]
+    fn service_manager_counts_as_reachable_only_once_it_reports_a_state() {
+        for unreachable in ["", "\n", "offline\n", "unknown\n"] {
+            assert!(!service_manager_answered(unreachable.as_bytes()));
+        }
+        for state in ["initializing\n", "starting\n", "running\n", "degraded\n"] {
+            assert!(service_manager_answered(state.as_bytes()));
+        }
     }
     use vm_spec::Mount;
 

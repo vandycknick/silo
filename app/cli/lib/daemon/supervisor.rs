@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::daemon::engine::{
     activate, ensure_docker_socket_parent, probe_docker_socket, stop_engine, wait_docker_socket,
-    ENGINE_REACHABLE_TIMEOUT, READY_TIMEOUT,
+    wait_service_manager, ENGINE_REACHABLE_TIMEOUT, READY_TIMEOUT,
 };
 use crate::daemon::provision::ensure_system_machine;
 use crate::daemon::record::DaemonRecord;
@@ -658,6 +658,7 @@ fn attempt<'a>(
         if readiness.outcome != MachineReadinessOutcome::Ready {
             bail!("system guest readiness ended with {:?}", readiness.outcome);
         }
+        wait_service_manager(&machine, READY_TIMEOUT).await?;
         status.phase = SystemPhase::ActivatingEngine;
         publish(publisher, status)?;
         activate(
