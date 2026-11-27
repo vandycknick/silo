@@ -28,6 +28,10 @@ identity between inspection and launch. Native inspection of the saved state
 determines restore compatibility, subject to construction-time checks. This
 revision also admits restore on krun with HVF on macOS arm64.
 
+The 2026-11-27 revision extends the clean storage certificate to krun on
+macOS arm64. Until then only Linux could record a `clean` stop; a completed
+orderly shutdown on macOS was recorded as `unknown`.
+
 Supersedes the "`vmm` Process Model" and "Startup and Shutdown Semantics"
 sections of [ADR 0004](0004-daemonless-architecture.md). The daemonless
 decision itself stands.
@@ -277,7 +281,8 @@ failure is diagnostic, not a clean-storage certificate. This does not invoke
 systemd or any other image service manager and does not run an orderly service
 shutdown.
 
-For the qualified Linux Raw attachment profile, the monitor retains each
+For the qualified krun Raw attachment profile, on Linux and on macOS arm64,
+the monitor retains each
 actual backing inode before native writes and supplies checked FD-derived
 paths to the worker. After actual native owners are terminal/reaped, its
 blocking finalizer checks synchronization of every writable retained Raw
@@ -292,8 +297,10 @@ The immutable manifest includes all block attachments and directory shares.
 Writable shares, unknown namespaces, unqualified raw-device/unmounted Data
 writers, external concurrent writers, image-owned PID1 without admitted
 shutdown authority and unqualified framework-owned attachment closure remain
-noncertifying; these VM shapes are not removed. Linux Raw proof does not
-qualify Darwin full-sync or VZ closure by analogy.
+noncertifying; these VM shapes are not removed. The krun Raw proof rests on
+the reaped worker owning every native writer and on the monitor's own
+synchronization of each retained handle, which is a full flush on macOS. It
+does not qualify VZ, whose attachments are closed by the framework.
 
 The manager alone reconciles lifecycle and storage outcome atomically for
 the expected run. A valid current forced/error outcome remains forced even

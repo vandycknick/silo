@@ -44,6 +44,7 @@ AGENT_PORT = 1027  # forward_spec::GUEST_CONTROL_VSOCK_PORT
 FORWARD_PORT = 1028  # forward_spec::FORWARD_VSOCK_PORT
 SSH_PORT = 22  # agent_spec::SSH_VSOCK_PORT
 MAX_CONTROL_LINE = 64
+PASSED_END_HOLD_SECONDS = 1.0
 MAX_FORWARD_LINE = 512  # forward_spec::MAX_TARGET_LINE_BYTES
 WAIT = 30
 READY = "READY whole-machine-production"
@@ -343,6 +344,7 @@ def silo_session_type(api_session_type: type) -> type:
             self.releases = []
             self.replies = []
             self.control_buffer = bytearray()
+            self.passed_ends: list[tuple[float, socket.socket]] = []
             self.process = None
             self.netd = None
             self.relay = None
@@ -527,14 +529,19 @@ def silo_session_type(api_session_type: type) -> type:
 
         def open_stream(self, port: int) -> socket.socket:
             """Fresh native CONNECT; the caller owns the returned end and its `OK` handshake."""
+            now = time.monotonic()
+            while self.passed_ends and self.passed_ends[0][0] <= now:
+                self.passed_ends.pop(0)[1].close()
             local, remote = socket.socketpair()
             try:
                 self.send_control(f"CONNECT {port}\n".encode(), remote.fileno())
             except BaseException:
                 local.close()
-                raise
-            finally:
                 remote.close()
+                raise
+            # macOS can lose a descriptor whose sender closes it while it is
+            # still in flight, so this copy outlives the native receive.
+            self.passed_ends.append((now + PASSED_END_HOLD_SECONDS, remote))
             return local
 
         def close(self):
@@ -551,6 +558,9 @@ def silo_session_type(api_session_type: type) -> type:
                         failures.append(f"network relay close: {error!r}")
                 for value in self.relay_sockets:
                     value.close()
+                for _, value in self.passed_ends:
+                    value.close()
+                self.passed_ends = []
                 self.relay_sockets = []
                 failures.extend(self.forward.join(2))
             self.cleanup_failures = list(dict.fromkeys([*self.cleanup_failures, *failures]))

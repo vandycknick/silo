@@ -121,6 +121,42 @@ def evidence_parent(variable: str = "SILO_SMOKE_EVIDENCE") -> Path:
     return parent
 
 
+def prune_retained(parents: list[tuple[Path, tuple[str, ...]]], *, now: float) -> list[Path]:
+    """Remove this user's retained smoke directories older than the retention window.
+
+    Failed tests and every session keep a workspace on purpose, and nothing
+    else ever removes them. `SILO_SMOKE_RETAIN_DAYS` sets the window (default
+    3); `0` keeps everything. Each parent names its own prefixes because the
+    macOS scratch parent is the shared `/private/tmp`.
+    """
+    days = float(os.environ.get("SILO_SMOKE_RETAIN_DAYS", "3"))
+    if days <= 0:
+        return []
+    cutoff = now - days * 86400
+
+    def writable(function, path, _error) -> None:
+        # Sealed evidence is read-only; a concurrent session may already have removed it.
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+            os.chmod(path, 0o700)
+            function(path)
+        except OSError:
+            pass
+
+    removed = []
+    for parent, prefixes in parents:
+        for entry in os.scandir(parent):
+            if not entry.name.startswith(prefixes) or not entry.is_dir(follow_symlinks=False):
+                continue
+            status = entry.stat(follow_symlinks=False)
+            if status.st_uid != os.geteuid() or status.st_mtime >= cutoff:
+                continue
+            shutil.rmtree(entry.path, onexc=writable)
+            if not os.path.lexists(entry.path):
+                removed.append(Path(entry.path))
+    return removed
+
+
 def workspace_parent() -> Path:
     """Durable scratch root for smoke Homes, registries and pytest temp files.
 

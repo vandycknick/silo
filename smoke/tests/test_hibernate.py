@@ -139,8 +139,7 @@ def test_stop_hibernated_then_cold_start(silo: Silo, basic_image: str, force: bo
     assert not directory.exists(), "discard/stop retained the unused save"
     if force:
         assert "Waking" not in result.stderr + result.stdout
-    elif sys.platform == "linux":
-        # Clean-stop certification is recorded on Linux only.
+    else:
         assert shutdown.outcome(silo, NAME) == "clean"
     silo.start(NAME)
     silo.wait_ready(NAME)

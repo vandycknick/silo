@@ -1084,7 +1084,12 @@ mod tests {
                 result
             });
             let mut command = tokio::process::Command::new("ssh");
+            // The developer's own ssh config and agent must not shape this run.
             command.args([
+                "-F",
+                "/dev/null",
+                "-o",
+                "IdentityAgent=none",
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",

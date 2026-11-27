@@ -7,6 +7,7 @@ from pathlib import Path
 import platform
 import os
 import tempfile
+import time
 
 from pluggy import Result
 import pytest
@@ -34,6 +35,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    if not hasattr(config, "workerinput"):
+        # Only the default evidence root is ours to prune; an override is the caller's directory.
+        parents = [(prereqs.workspace_parent(), ("silo-smoke-", "silo-run-"))]
+        if "SILO_SMOKE_EVIDENCE" not in os.environ:
+            parents.append((prereqs.evidence_parent(), ("run-",)))
+        prereqs.prune_retained(parents, now=time.time())
     if "SILO_SMOKE_EVIDENCE" not in os.environ:
         os.environ["SILO_SMOKE_EVIDENCE"] = tempfile.mkdtemp(prefix="run-", dir=prereqs.evidence_parent())
     for name, area in areas.AREAS.items():

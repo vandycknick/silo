@@ -208,3 +208,30 @@ def test_disk_clone_probe_reports_clonefile_and_leaves_no_files(tmp_path: Path) 
     assert probe["method"] == "clonefile" and probe["directory"] == str(tmp_path)
     assert probe["reflink"] is (probe["errno"] is None)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_retained_directories_older_than_the_window_are_pruned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000_000.0
+    day = 86400
+
+    def make(name: str, age_days: float) -> Path:
+        directory = tmp_path / name
+        (directory / "sealed").mkdir(parents=True)
+        evidence = directory / "sealed/memory.ram"
+        evidence.write_bytes(b"x")
+        evidence.chmod(0o400)
+        (directory / "sealed").chmod(0o500)
+        os.utime(directory, (now - age_days * day, now - age_days * day))
+        return directory
+
+    old = [make("silo-smoke-old", 4), make("silo-run-old", 10), make("silo-smoke-older", 3.5)]
+    fresh = make("silo-smoke-fresh", 1)
+    foreign = make("run-not-named-here", 30)
+    monkeypatch.delenv("SILO_SMOKE_RETAIN_DAYS", raising=False)
+    assert sorted(prereqs.prune_retained([(tmp_path, ("silo-smoke-", "silo-run-"))], now=now)) == sorted(old)
+    assert fresh.is_dir() and foreign.is_dir() and not any(path.exists() for path in old)
+    monkeypatch.setenv("SILO_SMOKE_RETAIN_DAYS", "0")
+    os.utime(fresh, (now - 30 * day, now - 30 * day))
+    assert prereqs.prune_retained([(tmp_path, ("silo-smoke-", "silo-run-"))], now=now) == [] and fresh.is_dir()
+    for directory in (fresh, foreign):
+        (directory / "sealed").chmod(0o700)

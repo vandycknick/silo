@@ -58,6 +58,13 @@ SEEDED_NEIGHBOUR_MAC = "02:53:49:4c:4f:aa"
 SOURCE = NetworkIdentity("02:00:00:00:00:01", "192.168.127.2", "192.168.127.1")
 TOPOLOGY_ALIAS = "192.168.127.9"
 
+
+def seeded_neighbours() -> tuple[str, str]:
+    """The ordinary and proxy neighbour addresses the source setup installs."""
+    network = ipaddress.IPv4Network(f"{SOURCE.ipv4}/{SOURCE.prefix_length}", strict=False)
+    return str(network.network_address + 50), str(network.network_address + 51)
+
+
 # Persistent continuation witness: started once by cold userdata, not a captured
 # exec/SSH session. Its parent exits; stdio is detached so provisioning returns.
 USERDATA = f"""#!/bin/sh
@@ -554,8 +561,7 @@ class Cohort:
                              "userdata_membership": values[USERDATA_MEMBERSHIP].decode(),
                              "witness_membership": values[WITNESS_MEMBERSHIP].decode()}
         ifindex, name = self.interface_index(source, SOURCE.mac)
-        network = ipaddress.IPv4Network(f"{SOURCE.ipv4}/{SOURCE.prefix_length}", strict=False)
-        ordinary, proxy = str(network.network_address + 50), str(network.network_address + 51)
+        ordinary, proxy = seeded_neighbours()
         setup = self.probe_json(source, identity, [PROBE, "setup", str(ifindex), MANAGED_NAME, ordinary, proxy,
                                                    SEEDED_NEIGHBOUR_MAC], "network-setup")
         require(setup["ifindex"] == ifindex and setup["name"] == MANAGED_NAME, "rename lost the retained ifindex")
@@ -750,11 +756,11 @@ class Cohort:
         require(any(route.get("dst_length") == 0 and route.get("gateway") == target.gateway
                     and route.get("oif") == ifindex and route.get("table") == 254
                     for route in observed["routes_ipv4"]), "destination default route absent")
-        seeded = {entry.get("destination") for entry in cut.source_setup["neighbours"]
-                  + cut.source_setup["proxy_neighbours"] if entry.get("ifindex") == ifindex}
+        # The kernel's own entries (for example ff02::16) are in both tables and are not source state.
+        seeded = set(seeded_neighbours())
         remaining = {entry.get("destination") for entry in observed["neighbours"] + observed["proxy_neighbours"]
                      if entry.get("ifindex") == ifindex}
-        require(seeded and not seeded & remaining, "seeded source neighbours survived activation")
+        require(not seeded & remaining, "seeded source neighbours survived activation")
         resolver = bytes.fromhex(observed["resolv_conf_hex"]).decode()
         require(f"nameserver {target.gateway}" in resolver.splitlines() and SOURCE.gateway not in resolver,
                 "resolver is not exactly the destination configuration")

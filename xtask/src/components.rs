@@ -186,18 +186,19 @@ fn run_tests(
     suite: TestSuite,
 ) -> Result<(), command::CommandError> {
     let ci = std::env::var("CI").is_ok_and(|value| value == "true");
-    if !matches!(suite, TestSuite::Unit) {
-        let mut build = standard_cargo_command(workspace_root, target_dir);
-        build.args([
-            "build",
-            "--locked",
-            "-p",
-            "silo-vmm",
-            "--features",
-            "mock-backend",
-        ]);
-        command::run(build)?;
-    }
+    // Unit tests start the mock monitor too. Without one prebuilt artifact
+    // every test process runs its own nested build, and on macOS each of those
+    // rewrites the signed binary while other tests are reading it.
+    let mut build = standard_cargo_command(workspace_root, target_dir);
+    build.args([
+        "build",
+        "--locked",
+        "-p",
+        "silo-vmm",
+        "--features",
+        "mock-backend",
+    ]);
+    command::run(build)?;
     // Real-process tests build private netd and tsgate copies. Warm Go's build
     // cache once before parallel nextest workers compete for the cold graph.
     // The flags must be the tests' own: tsgate is built without cgo, which
@@ -284,11 +285,12 @@ fn workspace_test_command(
         cargo.args(["--lib", "--bins"]);
     }
     if !matches!(suite, TestSuite::Unit) {
-        cargo.arg("--tests").env(
-            "SILO_TEST_MOCK_VMM_BINARY",
-            target_dir.join("debug/silo-vmm"),
-        );
+        cargo.arg("--tests");
     }
+    cargo.env(
+        "SILO_TEST_MOCK_VMM_BINARY",
+        target_dir.join("debug/silo-vmm"),
+    );
     cargo.args(["--features", HOST_TEST_FEATURES]);
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);

@@ -10,8 +10,10 @@
 //! Finalization is allowed only after the actual worker reaper completes.
 //! The blocking owner retains the same OFD lease while synchronizing every
 //! writable Raw and explicitly checking every close. Cancellation of a waiter
-//! cannot release that ownership. Darwin, VZ, writable shares and incomplete
-//! attachment coverage cannot obtain this Linux Raw certificate.
+//! cannot release that ownership. Only the krun backend retains attachments
+//! this way, on Linux and macOS alike; std `sync_all` is a full flush on
+//! macOS. VZ, writable shares and incomplete attachment coverage cannot obtain
+//! this Raw certificate.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -71,14 +73,12 @@ impl PreparedAttachments {
             attachments: Vec::with_capacity(config.disks().len()),
             raw_bindings: Vec::with_capacity(config.disks().len()),
             _lease: launch.lease.clone(),
-            flush_qualified: cfg!(target_os = "linux")
-                && !config.disks().is_empty()
+            flush_qualified: !config.disks().is_empty()
                 && config.mounts().iter().all(|mount| mount.read_only),
-            // On Linux all native block/virtiofs owners are threads in the
-            // reaped worker. Writer coverage and flush semantics do not change
-            // the independently observed process-owned descriptor closure.
-            closure_qualified: cfg!(target_os = "linux")
-                && (!config.disks().is_empty() || !config.mounts().is_empty()),
+            // All native block/virtiofs owners are threads in the reaped krun
+            // worker. Writer coverage and flush semantics do not change the
+            // independently observed process-owned descriptor closure.
+            closure_qualified: !config.disks().is_empty() || !config.mounts().is_empty(),
             #[cfg(test)]
             finalization_gate: None,
         };
@@ -501,7 +501,7 @@ mod tests {
             .expect("retain")
             .finish(false);
         assert!(!report.host_writes_flushed);
-        assert_eq!(report.attachments_closed, cfg!(target_os = "linux"));
+        assert!(report.attachments_closed);
     }
 
     #[test]
@@ -518,7 +518,7 @@ mod tests {
         };
         let report = prepared.finish(true);
         assert!(!report.host_writes_flushed);
-        assert_eq!(report.attachments_closed, cfg!(target_os = "linux"));
+        assert!(report.attachments_closed);
         assert!(report
             .error
             .expect("actual fsync error")
@@ -545,7 +545,7 @@ mod tests {
             .expect("retain complete coverage")
             .finish(true);
         assert!(!report.host_writes_flushed);
-        assert_eq!(report.attachments_closed, cfg!(target_os = "linux"));
+        assert!(report.attachments_closed);
         assert!(report.error.is_none());
     }
 
@@ -563,7 +563,7 @@ mod tests {
             .expect("retain character device")
             .finish(true);
         assert!(!report.host_writes_flushed);
-        assert_eq!(report.attachments_closed, cfg!(target_os = "linux"));
+        assert!(report.attachments_closed);
     }
 
     #[tokio::test]

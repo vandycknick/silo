@@ -116,6 +116,7 @@ automatically provisioned and never touch hosted credentials. Internet-dependent
 | `SILO_SMOKE_QEMU_IMG` | Optional extra oracle only, default PATH discovery when installed |
 | `SILO_SMOKE_BIN_DIR`, `SILO_SMOKE_RUNTIME_DIR`, `SILO_SMOKE_BACKEND` | Derived target/profile/host paths and krun default; pytest options/env remain overrides |
 | `SILO_SMOKE_CACHE`, `XDG_CACHE_HOME`, `SILO_SMOKE_KEEP` | Existing automatic cache and retention defaults |
+| `SILO_SMOKE_RETAIN_DAYS` | Retained workspaces and evidence older than this many days (default 3) are removed at session start; `0` keeps everything |
 | `PATH`, `HOME`, `PYTEST_XDIST_WORKER`, `SILO_NATIVE_API_EXECUTABLE` | Tool discovery, per-workspace isolation, worker labeling, internally supplied native entry, not manual inputs |
 
 
