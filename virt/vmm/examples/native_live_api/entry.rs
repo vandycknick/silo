@@ -246,6 +246,13 @@ pub(crate) fn main() -> eyre::Result<ExitCode> {
         standalone,
     } = Bootstrap::adopt_standalone_fixed(restore)?;
     crate::krun::worker::fds::start_watchdog(watchdog)?;
+    // Without this the native side of a failed run leaves no trace on stderr.
+    engine::init_log(
+        None,
+        engine::LogLevel::Info,
+        engine::LogStyle::Auto,
+        engine::LogOptions::empty(),
+    )?;
     let mut bytes = Vec::new();
     File::from(config).take(65537).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 65536, "launch metadata bound");

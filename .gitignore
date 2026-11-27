@@ -197,3 +197,6 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+
+# create-dmg, installed by `make package DMG=1`
+packaging/macos/node_modules/

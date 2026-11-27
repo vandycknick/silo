@@ -18,7 +18,9 @@ let
     pkgs.syft
     pkgs.zstd
     pkgs.python3
-  ];
+  ]
+  # `make package DMG=1` installs the pinned create-dmg with npm.
+  ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.nodejs_26 ];
   # Everything needed to compile, lint, and test the workspace. Deliberately
   # omits the cross-compilation and packaging tools that only release builds
   # invoke, because CI pays to download this closure on every runner.
