@@ -1411,12 +1411,15 @@ fn signal_process(process: &RunningProcess, signal: SignalProcess) -> Result<(),
     Ok(())
 }
 
+/// The leader exiting does not end its process group. A descendant that
+/// ignores or cannot yet take SIGTERM (a frozen task) would keep the session's
+/// output pipes open, so the group is always killed before returning.
 fn terminate_and_reap(child: &mut Child, process_group: i32) {
     signal_process_group(process_group, Signal::SIGTERM);
     let deadline = Instant::now() + DISCONNECT_GRACE;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) | Err(_) => break,
             Ok(None) if Instant::now() >= deadline => break,
             Ok(None) => thread::sleep(POLL_INTERVAL),
         }
@@ -2298,6 +2301,47 @@ mod tests {
             })
             .await;
         sent
+    }
+
+    #[test]
+    fn termination_kills_a_descendant_that_outlives_its_leader() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::unix::process::CommandExt;
+
+        // The leader dies on SIGTERM; the descendant ignores it and holds stdout.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "(trap '' TERM; echo ready; exec sleep 30) & wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = i32::try_from(child.id()).unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+
+        crate::guest_process::terminate_and_reap(&mut child, group);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut rest = Vec::new();
+            let result = output.read_to_end(&mut rest);
+            let _ = done.send(result.map(|_| rest));
+        });
+        let drained = finished.recv_timeout(Duration::from_secs(5));
+        // Never leave the sleeper behind, whatever the assertion below decides.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        reader.join().unwrap();
+        assert_eq!(
+            drained
+                .expect("output pipe still held by a surviving descendant")
+                .unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[tokio::test]
